@@ -1,0 +1,8 @@
+.venv/
+output/
+data/
+__pycache__/
+*.pyc
+*.ipynb_checkpoints
+logs/
+scripts/archive/

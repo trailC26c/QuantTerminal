@@ -1,0 +1,542 @@
+"""
+=========================================================================
+📡 QUANT TERMINAL: STEP 5 MULTI-REGIME REAL-TIME MACRO BAROMETER
+=========================================================================
+File Name: macro_barometer.py
+Block 1 of 6: Environment Modules, CLI Argument Parsers, and Directory Layouts.
+Standardized to an absolute flat 4-space nested indentation frame.
+"""
+
+import os
+import glob
+import re
+import time
+import argparse
+from datetime import datetime, timedelta
+from pathlib import Path
+import pandas as pd
+import numpy as np
+import yfinance as yf
+import plotly.graph_objects as go
+from plotly.subplots import make_subplots
+
+# Silence yfinance terminal internal data warnings
+import logging
+logging.getLogger('yfinance').setLevel(logging.CRITICAL)
+
+# =========================================================================
+# 🎛️ COMMAND LINE INTERFACE (CLI) ARGUMENT EXTENSION PARSER
+# =========================================================================
+parser = argparse.ArgumentParser(description="QUANT TERMINAL: Macro Engine")
+parser.add_argument("--window", type=int, default=252, help="Normalization lookback window (default: 252)")
+parser.add_argument("--shift", type=int, default=0, help="Mathematical backtest shift (default: 0)")
+parser.add_argument("--range", type=int, default=504, help="Visual plot horizon range in bars (default: 504)")
+parser.add_argument("--scale_min", type=float, default=1.0, help="Lower bound coefficient (default: 1.0)")
+parser.add_argument("--scale_max", type=float, default=11.0, help="Upper bound ceiling coefficient (default: 11.0)")
+
+# OSCILLATOR LOOKBACK SWITCHES
+parser.add_argument("--mf_window", type=int, default=12, help="Market Forecast intermediate lookback (default: 12)")
+parser.add_argument("--stoch_k", type=int, default=9, help="Stochastic Slow %K channel window (default: 9)")
+parser.add_argument("--stoch_d", type=int, default=5, help="Stochastic Slow %D smoothing filter (default: 5)")
+
+args, unknown = parser.parse_known_args()  
+NORM_WINDOW = args.window
+SHIFT_BARS = args.shift
+PLOT_RANGE = args.range
+SCALE_MIN = args.scale_min
+SCALE_MAX = args.scale_max
+MF_WINDOW = args.mf_window
+STOCH_K = args.stoch_k
+STOCH_D = args.stoch_d
+
+# =========================================================================
+# 📂 DIRECTORY STRUCTURE & ROUTING SPECIFICATIONS
+# =========================================================================
+BASE_DIR = r"C:\Users\tcnet\TOS_Data_Local"
+WATCHLIST_DIR = os.path.join(BASE_DIR, "sanitized_watchlists")
+MACRO_DIR = os.path.join(BASE_DIR, "macro_barometer")
+CHARTS_DIR = os.path.join(MACRO_DIR, "charts")
+
+os.makedirs(MACRO_DIR, exist_ok=True)
+os.makedirs(CHARTS_DIR, exist_ok=True)
+
+SPRING_OFFSET = 0.0
+
+def parse_telemetry_config():
+    """Reads telemetry_list.txt configuration and handles multi-line vertical columns."""
+    config_path = os.path.join(MACRO_DIR, "telemetry_list.txt")
+    index_symbols = []
+    alpha_singles = []
+    current_section = None
+
+    if not os.path.exists(config_path):
+        return index_symbols, alpha_singles
+
+    with open(config_path, 'r', encoding='utf-8') as f:
+        for line in f:
+            line_str = line.strip()
+            if not line_str or line_str.startswith('#'): continue
+            if line_str == "[INDEX_PAIRS]":
+                current_section = "INDEX"
+                continue
+            elif line_str == "[ALPHA_SINGLES]":
+                current_section = "ALPHA"
+                continue
+            
+            tokens = [t.strip().upper() for t in line_str.split(',') if t.strip()]
+            if current_section == "INDEX": index_symbols.extend(tokens)
+            elif current_section == "ALPHA": alpha_singles.extend(tokens)
+
+    return index_symbols, alpha_singles
+"""
+QUANT TERMINAL - Step 5: Real-Time Multi-Regime Macro Barometer Dashboard
+Block 2 of 6: Technical Indicator Engines and Cumulative Math Normalizers.
+🎯 TYPE SHIELD ADDED: Natively forces date objects to strings to prevent strptime crashes.
+"""
+
+def translate_tos_symbol(sym):
+    """Maps Thinkorswim system notation futures seamlessly into ETF anchors."""
+    clean_sym = str(sym).strip().upper()
+    if clean_sym.startswith('/'): clean_sym = clean_sym[1:]
+    mapping = {
+        'ES': 'SPY', 'NQ': 'QQQ', 'YM': 'DIA', 'RTY': 'IWM', 
+        'GC': 'GLD', 'SI': 'SLV', 'BZ': 'BNO', 'NG': 'UNG',
+        'ZT': 'SHY', 'ZB': 'TLT', 'ZN': 'IEF', 'ZF': 'IEI'
+    }
+    return mapping.get(clean_sym, clean_sym)
+
+
+def min_max_normalize_shifted_series(window, shift, series):
+    """Calculates static bounds across defined blocks to enforce continuous curves."""
+    total_len = len(series)
+    end_idx = total_len - shift
+    start_idx = max(0, end_idx - PLOT_RANGE)
+    boundary_range_subset = series.iloc[start_idx:end_idx]
+    h_min = boundary_range_subset.min()
+    h_max = boundary_range_subset.max()
+    denom = h_max - h_min if (h_max - h_min) != 0 else 1.0
+    return pd.Series(SCALE_MIN + ((series - h_min) / denom) * (SCALE_MAX - SCALE_MIN), index=series.index)
+
+
+def compute_raw_obv_vector(close_series, volume_series):
+    """Computes continuous cumulative On-Balance Volume on raw statistics first."""
+    closes = close_series.to_numpy()
+    volumes = volume_series.to_numpy()
+    obv_array = np.zeros(len(closes), dtype=np.float64)
+    
+    current_obv = 0.0
+    for i in range(1, len(closes)):
+        if closes[i] > closes[i-1]:
+            current_obv += float(volumes[i])
+        elif closes[i] < closes[i-1]:
+            current_obv -= float(volumes[i])
+        obv_array[i] = current_obv
+        
+    return pd.Series(obv_array, index=close_series.index)
+
+
+def calculate_opex_coordinates(df_chart, timeline_x, effective_today_date):
+    """Locates historical OpEx Fridays and projects next two monthly targets."""
+    # 🎯 SHIELD ENGINE: Force string validation up-front to absorb raw datatype drift leaks
+    if hasattr(effective_today_date, 'strftime'):
+        dt_str = effective_today_date.strftime("%Y-%m-%d")
+    else:
+        dt_str = str(effective_today_date).split(' ')[0]
+        
+    eff_dt_obj = datetime.strptime(dt_str, "%Y-%m-%d")
+    
+    opex_x_coords = []
+    unique_months = set()
+    for idx in range(len(df_chart) - 1, -1, -1):
+        row_date = df_chart.index[idx]
+        month_key = f"{row_date.year}-{row_date.month}"
+        if month_key not in unique_months:
+            first_of_month = datetime(row_date.year, row_date.month, 1)
+            first_friday_offset = (4 - first_of_month.weekday()) % 7
+            third_friday = first_of_month + timedelta(days=first_friday_offset + 14)
+            if row_date.date() == third_friday.date() or (row_date.weekday() == 3 and (third_friday.date() - row_date.date()).days == 1):
+                if idx < len(timeline_x):
+                    opex_x_coords.append(timeline_x[idx])
+                    unique_months.add(month_key)
+    return opex_x_coords, 15, 45
+"""
+QUANT TERMINAL - Step 5: Real-Time Multi-Regime Macro Barometer Dashboard
+Block 3 of 6: Master Charting Data Frame Pre-Processors and Raw OBV Radar Sweeps.
+"""
+
+def generate_unified_two_pane_chart(symbol, anchors, consensus_positions, current_run_date):
+    """Processes indices and alpha tokens identically into stretched 2-pane charts."""
+    clean_sym = str(symbol).strip().upper()
+    lbl_sym = clean_sym.replace('/', '')
+    tick_lookup = translate_tos_symbol(clean_sym)
+    
+    try:
+        # Pull 6 years of deep history to provide complete lookback cushions
+        px_raw = yf.download(tick_lookup, period="6y", progress=False)
+        close_ser = px_raw['Close'].iloc[:, 0] if isinstance(px_raw['Close'], pd.DataFrame) else px_raw['Close']
+        vol_ser = px_raw['Volume'].iloc[:, 0] if isinstance(px_raw['Volume'], pd.DataFrame) else px_raw['Volume']
+        high_ser = px_raw['High'].iloc[:, 0] if isinstance(px_raw['High'], pd.DataFrame) else px_raw['High']
+        low_ser = px_raw['Low'].iloc[:, 0] if isinstance(px_raw['Low'], pd.DataFrame) else px_raw['Low']
+        
+        df_p = pd.DataFrame(index=close_ser.index)
+        df_p['Close'] = close_ser
+        df_p['Volume'] = vol_ser
+        df_p['High'] = high_ser
+        df_p['Low'] = low_ser
+        df_p.index = df_p.index.tz_localize(None)
+        df_p = df_p.join(anchors, how='inner').dropna()
+        
+        # --- THE PHYSICAL ACCELERATOR: RAW OBV5 ANALYSIS LOOP ---
+        df_p['raw_obv'] = compute_raw_obv_vector(df_p['Close'], df_p['Volume'])
+        
+        buy_marker_stack = {}  
+        sell_marker_stack = {}
+        
+        end_idx = len(df_p) - SHIFT_BARS
+        start_idx = max(0, end_idx - PLOT_RANGE)
+        
+        periods = {90: "P1", 180: "P2", 270: "P3", 360: "P4", 50: "P5"}
+        
+        # SCAN 5-BAR TOLERANCE ZONE BACKWARD FROM TODAY'S HORIZON LINE
+        for bar_offset in range(0, 6):
+            target_idx = end_idx - 1 - bar_offset
+            if target_idx < 360: continue
+            view_x_coord = -bar_offset
+            
+            for length, label in periods.items():
+                lookback_chunk = df_p['raw_obv'].iloc[target_idx - length : target_idx + 1]
+                
+                if df_p['raw_obv'].iloc[target_idx] == lookback_chunk.max():
+                    if view_x_coord not in buy_marker_stack: buy_marker_stack[view_x_coord] = []
+                    if label not in buy_marker_stack[view_x_coord]: buy_marker_stack[view_x_coord].append(label)
+                    
+                if df_p['raw_obv'].iloc[target_idx] == lookback_chunk.min():
+                    if view_x_coord not in sell_marker_stack: sell_marker_stack[view_x_coord] = []
+                    if label not in sell_marker_stack[view_x_coord]: sell_marker_stack[view_x_coord].append(label)
+
+        df_slice = df_p.iloc[start_idx:end_idx].copy()
+        timeline_x = np.arange(-len(df_slice), 0)
+        
+        g_min_p = df_slice['Close'].min(); g_max_p = df_slice['Close'].max()
+        denom_p = g_max_p - g_min_p if (g_max_p - g_min_p) != 0 else 1.0
+        df_slice['norm_A'] = SCALE_MIN + ((df_slice['Close'] - g_min_p) / denom_p) * (SCALE_MAX - SCALE_MIN)
+
+
+        # --- ADVANCED PANEL 2 INDEPENDENT INDICATOR PIPELINES ---
+        raw_obv_wave = min_max_normalize_shifted_series(NORM_WINDOW, SHIFT_BARS, df_slice['raw_obv'])
+        
+        # Pure amplitude scaling factor right from the absolute zero floor up
+        OBV5_MULTIP = 2.0
+        df_slice['norm_OBV_wave'] = raw_obv_wave * OBV5_MULTIP
+        
+        roll_low = df_slice['Low'].rolling(window=MF_WINDOW, min_periods=1).min()
+        roll_high = df_slice['High'].rolling(window=MF_WINDOW, min_periods=1).max()
+        denom_mf = np.where((roll_high - roll_low) == 0, 1.0, roll_high - roll_low)
+        raw_market_forecast = ((df_slice['Close'] - roll_low) / denom_mf) * 100.0
+        
+        # INTERNAL FACTOR DAMPENERS: Compresses raw indicator amplitudes by half to prevent panel clutter
+        MF_DAMPENER = 2.0
+        STOCH_DAMPENER = 2.0
+        df_slice['market_forecast'] = 50.0 + (raw_market_forecast - 50.0) / MF_DAMPENER
+        
+        stoch_lowest = df_slice['Low'].rolling(window=STOCH_K, min_periods=1).min()
+        stoch_highest = df_slice['High'].rolling(window=STOCH_K, min_periods=1).max()
+        denom_stoch = np.where((stoch_highest - stoch_lowest) == 0, 1.0, stoch_highest - stoch_lowest)
+        raw_pct_k = ((df_slice['Close'] - stoch_lowest) / denom_stoch) * 100.0
+        
+        slow_k = raw_pct_k.rolling(window=3, min_periods=1).mean()
+        slow_d = slow_k.rolling(window=STOCH_D, min_periods=1).mean()
+        df_slice['stoch_delta_wave'] = 50.0 + ((slow_k - slow_d) * 1.5) / STOCH_DAMPENER
+        
+        df_slice['sma_r'] = df_slice['Close'].rolling(window=NORM_WINDOW, min_periods=1).mean()
+        df_slice['norm_s'] = min_max_normalize_shifted_series(NORM_WINDOW, SHIFT_BARS, df_slice['sma_r'])
+        df_slice['vs_vx'] = df_slice['norm_A'] - df_slice['norm_VIX']
+        df_slice['vs_uup'] = df_slice['norm_A'] - df_slice['norm_UUP']
+        df_slice['spring'] = df_slice['norm_A'] - df_slice['norm_s']
+        
+        # FIX PASS INITIALIZATION KEY: Enforces absolute dual-Y channel readiness across both panels
+        fig = make_subplots(
+            rows=2, cols=1, shared_xaxes=True, vertical_spacing=0.05,
+            specs=[[{"secondary_y": True}], [{"secondary_y": True}]],
+            subplot_titles=(f"PANEL 1: CORE RECONCILED PROFILE ({lbl_sym})", f"PANEL 2: HOOKE'S LAW RISK MATRIX FACTOR OVERLAYS FOR {lbl_sym}")
+        )
+        
+        # Panel 1 Traces
+        fig.add_trace(go.Scatter(x=timeline_x, y=df_slice['norm_A'], name=lbl_sym, line=dict(color='#00F0FF', width=2.5)), row=1, col=1, secondary_y=False)
+        fig.add_trace(go.Scatter(x=timeline_x, y=df_slice['norm_VIX'], name='norm_VIX', line=dict(color='#FF3B30', width=1.5, dash='dot')), row=1, col=1, secondary_y=False)
+        fig.add_trace(go.Scatter(x=timeline_x, y=df_slice['norm_UUP'], name='norm_UUP', line=dict(color='#34C759', width=1.5, dash='dot')), row=1, col=1, secondary_y=False)
+        fig.add_trace(go.Scatter(x=timeline_x, y=df_slice['Close'], name=f"Raw {lbl_sym} Price", line=dict(color='#63E6BE', width=1.0)), row=1, col=1, secondary_y=True)
+        
+        # Plot Stacked Accumulation Entries
+        for x_pos, hit_labels in buy_marker_stack.items():
+            base_y = float(df_slice['norm_A'].iloc[x_pos])
+            for stack_idx, lbl in enumerate(hit_labels):
+                offset_y = base_y - 0.45 - (stack_idx * 0.40)
+                fig.add_trace(go.Scatter(
+                    x=[x_pos], y=[offset_y], mode="markers+text", name=f"Accumulation {lbl}", showlegend=False,
+                    marker=dict(symbol="triangle-up", size=10, color="#00FF66"),
+                    text=f"🟢 {lbl}", textposition="bottom center", textfont=dict(size=9, color="#00FF66")
+                ), row=1, col=1, secondary_y=False)
+                
+        # Plot Stacked Distribution Breakdowns
+        for x_pos, hit_labels in sell_marker_stack.items():
+            base_y = float(df_slice['norm_A'].iloc[x_pos])
+            for stack_idx, lbl in enumerate(hit_labels):
+                offset_y = base_y + 0.45 + (stack_idx * 0.40)
+                fig.add_trace(go.Scatter(
+                    x=[x_pos], y=[offset_y], mode="markers+text", name=f"Distribution {lbl}", showlegend=False,
+                    marker=dict(symbol="triangle-down", size=10, color="#FF3B30"),
+                    text=f"🔴 {lbl}", textposition="top center", textfont=dict(size=9, color="#FF3B30")
+                ), row=1, col=1, secondary_y=False)
+        
+        # Panel 2 Traces
+        fig.add_trace(go.Scatter(x=timeline_x, y=df_slice['vs_vx'], name=f'vs VIX Delta', line=dict(color='#FF9500', width=2.2)), row=2, col=1, secondary_y=False)
+        fig.add_trace(go.Scatter(x=timeline_x, y=df_slice['vs_uup'], name=f'vs UUP Delta', line=dict(color='#AF52DE', width=2.2)), row=2, col=1, secondary_y=False)
+        fig.add_trace(go.Scatter(x=timeline_x, y=df_slice['spring'], name=f'Spring Tension Velocity', line=dict(color='#00FF66', width=2.5)), row=2, col=1, secondary_y=False)
+        
+        fig.add_trace(go.Scatter(x=timeline_x, y=df_slice['norm_OBV_wave'], name="Normalized OBV5 Wave", line=dict(color='#FFD700', width=2.0)), row=2, col=1, secondary_y=True)
+        fig.add_trace(go.Scatter(x=timeline_x, y=df_slice['market_forecast'], name="TOS Market Forecast (Int)", line=dict(color='#B5179E', width=1.0, dash='dot')), row=2, col=1, secondary_y=True)
+        fig.add_trace(go.Scatter(x=timeline_x, y=df_slice['stoch_delta_wave'], name="Stochastic Slow Delta %K-%D", line=dict(color='#4CC9F0', width=1.0, dash='dot')), row=2, col=1, secondary_y=True)
+        
+        hist_opex_x, n_opex, f_opex = calculate_opex_coordinates(df_slice, timeline_x, current_run_date)
+        for h_x in hist_opex_x:
+            for r in [1,2]: fig.add_vline(x=h_x, line=dict(color='#9B5DE5', width=1.2, dash='dash'), row=r, col=1)
+
+        # Apply left axis title spacing standoffs cleanly
+        fig.update_yaxes(range=[0.5, SCALE_MAX + 1.0], title=dict(text="Regime Normalization Bounds", standoff=12), row=1, col=1, secondary_y=False, gridcolor='#2C2C2E', zerolinecolor='#48484A', showticklabels=True)
+        fig.update_yaxes(title_text="Raw Value Price Axis ($)", row=1, col=1, secondary_y=True, gridcolor='#2C2C2E')
+        fig.update_xaxes(gridcolor='#2C2C2E', row=1, col=1)
+        
+        sub_min_2 = df_slice[['vs_vx', 'vs_uup', 'spring']].min().min()
+        sub_max_2 = df_slice[['vs_vx', 'vs_uup', 'spring']].max().max()
+        span_2 = sub_max_2 - sub_min_2 if (sub_max_2 - sub_min_2) != 0 else 1.0
+        fig.update_yaxes(range=[sub_min_2 - (span_2 * 0.15), sub_max_2 + (span_2 * 0.15)], title=dict(text="Hooke Physics Tension Deltas", standoff=12), row=2, col=1, secondary_y=False, gridcolor='#2C2C2E', zerolinecolor='#48484A', showticklabels=True)
+        fig.update_yaxes(range=[-5.0, 105.0], title_text="Oscillators Percentage Scale (%)", row=2, col=1, secondary_y=True, gridcolor='#2C2C2E')
+        fig.update_xaxes(gridcolor='#2C2C2E', row=2, col=1)
+
+        fig.update_xaxes(showspikes=True, spikethickness=1, spikedash="solid", spikecolor="#A1A1A6", spikemode="across")
+        fig.update_yaxes(showspikes=True, spikethickness=1, spikedash="solid", spikecolor="#A1A1A6", secondary_y=False)
+        fig.update_yaxes(showspikes=True, spikethickness=1, spikedash="solid", spikecolor="#A1A1A6", secondary_y=True)
+
+        # 🎯 FIX PASS EXECUTED: Purges conflicting 'ncols' property completely to unlock unbroken chart rendering
+        fig.update_layout(
+            title=dict(text=f"📡 QUANT MATRIX TERMINAL: {lbl_sym} ADVANCED PROFILE", font=dict(size=16, color='#FFFFFF'), x=0.5, xanchor='center'),
+            template="plotly_dark", paper_bgcolor='#1C1C1E', plot_bgcolor='#1C1C1E',
+            height=1200, width=950, margin=dict(l=100, r=80, t=100, b=50),
+            showlegend=True, 
+            legend=dict(
+                orientation="h", yanchor="bottom", y=1.01, xanchor="center", x=0.5,
+                font=dict(size=9, color="#D1D1D6")
+            ),
+            hovermode="x unified",
+            hoverlabel=dict(bgcolor="rgba(28, 28, 30, 0.65)", bordercolor="rgba(85, 85, 85, 0.50)", font=dict(size=12, color="#FFFFFF"))
+        )
+        
+        dt_file_lbl = current_run_date.strftime("%Y-%m-%d") if hasattr(current_run_date, 'strftime') else str(current_run_date).split(' ')
+        out_name = f"{dt_file_lbl}_{lbl_sym}_BAROMETER.html"
+        fig.write_html(os.path.join(CHARTS_DIR, out_name), include_plotlyjs='inline')
+        print(f"   ✨ Unified Portrait Canvas Compiled Successfully -> {out_name}")
+        consensus_positions.append(float(df_slice['spring'].iloc[-1]))
+    except Exception as e:
+        print(f"   ⚠️ Visual Engine Exception for {lbl_sym}: {e}")
+
+"""
+QUANT TERMINAL - Step 5: Real-Time Multi-Regime Macro Barometer Dashboard
+Block 5 of 6: Central Pipeline Orchestration and Broad Anchor Data Harvesters.
+"""
+
+def run_macro_barometer_pipeline():
+    print("========================================================")
+    print("🌍 RUNNING CORE MACRO BAROMETER PIPELINE ENGINE")
+    print(f"📡 Math Normalization Window:    {NORM_WINDOW} Bars")
+    print(f"📊 Display View Range Horizon:   {PLOT_RANGE} Bars")
+    print(f"⚖️ Mathematical Backtest Shift:  {SHIFT_BARS} Bars Back")
+    print(f"📏 Scale Constraints Injected:  Min={SCALE_MIN} | Max={SCALE_MAX}")
+    print("========================================================\n")
+    
+    current_run_date = datetime.now().strftime("%Y-%m-%d")
+    index_symbols, alpha_singles = parse_telemetry_config()
+    
+    print("📡 Ingesting Risk Anchors (^VIX, UUP) from yfinance...")
+    vix_df = yf.download('^VIX', period="6y", progress=False)
+    uup_df = yf.download('UUP', period="6y", progress=False)
+    
+    ser_vix = vix_df['Close'].iloc[:, 0] if isinstance(vix_df['Close'], pd.DataFrame) else vix_df['Close']
+    ser_uup = uup_df['Close'].iloc[:, 0] if isinstance(uup_df['Close'], pd.DataFrame) else uup_df['Close']
+    
+    anchors = pd.DataFrame(index=vix_df.index)
+    anchors['VIX_Close'] = ser_vix
+    anchors['UUP_Close'] = ser_uup
+    anchors.index = anchors.index.tz_localize(None)
+    anchors = anchors.ffill().bfill().dropna()
+    
+    anchors['norm_VIX'] = min_max_normalize_shifted_series(NORM_WINDOW, SHIFT_BARS, anchors['VIX_Close'])
+    anchors['norm_UUP'] = min_max_normalize_shifted_series(NORM_WINDOW, SHIFT_BARS, anchors['UUP_Close'])
+    
+    consensus_positions = []
+    
+    print("📈 Executing Engine 1: Unified Macro Index Core Parsing...")
+    if index_symbols:
+        for sym in index_symbols:
+            generate_unified_two_pane_chart(sym, anchors, consensus_positions, current_run_date)
+        
+    print("\n🔬 Executing Engine 2: Alpha Tracking Stock Single Slices...")
+    if alpha_singles:
+        for sym in alpha_singles:
+            generate_unified_two_pane_chart(sym, anchors, consensus_positions, current_run_date)
+    """
+    QUANT TERMINAL - Step 5: Real-Time Multi-Regime Macro Barometer Dashboard
+    Block 6 of 6: Symmetrical Ledger Exporter with Precision Timeline Bar String Logs.
+    🎯 DATA INSULATION BLOCK: Protects current_run_date from object mutations inside loop.
+    """
+    print("\n⚖️ Computing Portfolio Risk Allocation Consensus Models...")
+    core_equity_anchors = ('SPY', 'QQQ', 'DIA', 'IWM')
+    ledger_rows = []
+    breadth_tension_pool = []
+    
+    obv4_periods = {90: "P1", 180: "P2", 270: "P3", 360: "P4"}
+    
+    # 🎯 SHIELD PASS: Capture immutable baseline text token to immunize lookups
+    static_dt_str = datetime.now().strftime("%Y-%m-%d")
+    
+    for tick in core_equity_anchors:
+        try:
+            raw_px = yf.download(tick, period="6y", progress=False)
+            close_ser = raw_px['Close'].iloc[:, 0] if isinstance(raw_px['Close'], pd.DataFrame) else raw_px['Close']
+            vol_ser = raw_px['Volume'].iloc[:, 0] if isinstance(raw_px['Volume'], pd.DataFrame) else raw_px['Volume']
+            
+            df_m = pd.DataFrame(index=anchors.index)
+            df_m['Close'] = close_ser
+            df_m['Volume'] = vol_ser
+            df_m.index = df_m.index.tz_localize(None)
+            df_m = df_m.join(anchors, how='inner').dropna()
+            
+            df_m['raw_obv'] = np.zeros(len(df_m))
+            current_obv = 0.0
+            for i in range(1, len(df_m)):
+                if df_m['Close'].iloc[i] > df_m['Close'].iloc[i-1]:
+                    current_obv += float(df_m['Volume'].iloc[i])
+                elif df_m['Close'].iloc[i] < df_m['Close'].iloc[i-1]:
+                    current_obv -= float(df_m['Volume'].iloc[i])
+                df_m['raw_obv'].iloc[i] = current_obv
+                
+            df_m['norm_A'] = min_max_normalize_shifted_series(NORM_WINDOW, SHIFT_BARS, df_m['Close'])
+            df_m['sma_r'] = df_m['Close'].rolling(window=NORM_WINDOW, min_periods=1).mean()
+            df_m['norm_s'] = min_max_normalize_shifted_series(NORM_WINDOW, SHIFT_BARS, df_m['sma_r'])
+            df_m['vs_vx'] = df_m['norm_A'] - df_m['norm_VIX']
+            df_m['vs_uup'] = df_m['norm_A'] - df_m['norm_UUP']
+            df_m['spring'] = df_m['Close'] - df_m['sma_r']
+            
+            end_idx = len(df_m) - SHIFT_BARS
+            start_idx = max(0, end_idx - PLOT_RANGE)
+            
+            obv4_triggered_labels = []
+            obv4_triggered_bars = []
+            obv50_triggered_labels = []
+            obv50_triggered_bars = []
+            
+            for bar_offset in range(0, 6):
+                target_idx = end_idx - 1 - bar_offset
+                if target_idx < 360: continue
+                bar_str = f"-{SHIFT_BARS + bar_offset}" if SHIFT_BARS > 0 or bar_offset > 0 else "0"
+                
+                for length, label in obv4_periods.items():
+                    lookback_chunk = df_m['raw_obv'].iloc[target_idx - length : target_idx + 1]
+                    if df_m['raw_obv'].iloc[target_idx] == lookback_chunk.max() or df_m['raw_obv'].iloc[target_idx] == lookback_chunk.min():
+                        if label not in obv4_triggered_labels: obv4_triggered_labels.append(label)
+                        if bar_str not in obv4_triggered_bars: obv4_triggered_bars.append(bar_str)
+                            
+                p5_lookback = df_m['raw_obv'].iloc[target_idx - 50 : target_idx + 1]
+                if df_m['raw_obv'].iloc[target_idx] == p5_lookback.max() or df_m['raw_obv'].iloc[target_idx] == p5_lookback.min():
+                    if "P5" not in obv50_triggered_labels: obv50_triggered_labels.append("P5")
+                    if bar_str not in obv50_triggered_bars: obv50_triggered_bars.append(bar_str)
+            
+            row_metrics = {
+                "Symbol": tick, "Sub_Weighting": 1.0, "cross_pct": 1.0,
+                "obv4_Score": len(obv4_triggered_labels),
+                "obv4_Trigger_Periods": "|".join(obv4_triggered_labels) if obv4_triggered_labels else "None",
+                "obv4_Trigger_Bars": "|".join(obv4_triggered_bars) if obv4_triggered_bars else "None",
+                "obv50_Score": 1 if obv50_triggered_labels else 0,
+                "obv50_Trigger_Periods": "50" if obv50_triggered_labels else "None",
+                "obv50_Trigger_Bars": "|".join(obv50_triggered_bars) if obv50_triggered_bars else "None"
+            }
+            
+            for col, key in [('vs_vx', 'vix'), ('vs_uup', 'uup'), ('spring', 'sma')]:
+                curr_val = df_m[col].iloc[end_idx - 1]
+                hist = df_m[col].iloc[start_idx:end_idx]
+                h_min = float(hist.min()); h_max = float(hist.max())
+                ceil_M = max(abs(h_max), abs(h_min)); denom = ceil_M if ceil_M != 0 else 1.0
+                pct_pos = (curr_val / denom) * 100.0
+                
+                row_metrics[f"{key}_M"] = round(ceil_M, 4)
+                row_metrics[f"{key}_min"] = round(h_min, 4)
+                row_metrics[f"{key}_max"] = round(h_max, 4)
+                row_metrics[f"{key}_pct"] = round(pct_pos, 2)
+                breadth_tension_pool.append(pct_pos)
+                
+            ledger_rows.append(row_metrics)
+        except Exception as e:
+            print(f"   ⚠️ Exporter Extraction Exception for {tick}: {e}")
+
+    if ledger_rows:
+        ledger_df = pd.DataFrame(ledger_rows)
+        avg_vix_pct = round(np.mean(ledger_df['vix_pct']), 2)
+        avg_uup_pct = round(np.mean(ledger_df['uup_pct']), 2)
+        avg_sma_pct = round(np.mean(ledger_df['sma_pct']), 2)
+        avg_global_cross = round(np.mean([avg_vix_pct, avg_uup_pct, avg_sma_pct]), 2)
+        
+        row_5 = {
+            "Symbol": "UNIFIED_MACRO_CONSENSUS", "Sub_Weighting": "---", "cross_pct": avg_global_cross,
+            "obv4_Score": "---", "obv4_Trigger_Periods": "---", "obv4_Trigger_Bars": "---",
+            "obv50_Score": "---", "obv50_Trigger_Periods": "---", "obv50_Trigger_Bars": "---",
+            "vix_M": "---", "vix_min": "---", "vix_max": "---", "vix_pct": avg_vix_pct,
+            "uup_M": "---", "uup_min": "---", "uup_max": "---", "uup_pct": avg_uup_pct,
+            "sma_M": "---", "sma_min": "---", "sma_max": "---", "sma_pct": avg_sma_pct
+        }
+        ledger_df = pd.concat([ledger_df, pd.DataFrame([row_5])], ignore_index=True)
+        
+        ordered_cols = [
+            "Symbol", "Sub_Weighting", "cross_pct", 
+            "obv4_Score", "obv4_Trigger_Periods", "obv4_Trigger_Bars",
+            "obv50_Score", "obv50_Trigger_Periods", "obv50_Trigger_Bars",
+            "vix_M", "vix_min", "vix_max", "vix_pct", 
+            "uup_M", "uup_min", "uup_max", "uup_pct", 
+            "sma_M", "sma_min", "sma_max", "sma_pct"
+        ]
+        ledger_df = ledger_df[[c for c in ordered_cols if c in ledger_df.columns]]
+        
+        ledger_path = os.path.join(MACRO_DIR, "macro_tension_ledger.csv")
+        ledger_df.to_csv(ledger_path, index=False)
+        
+        mean_tension_pct = np.nanmean(breadth_tension_pool)
+        consensus_level = int(round((-mean_tension_pct) / 20.0))
+        consensus_level = max(-5, min(5, consensus_level))
+        long_multiplier = round(max(0.00, min(5.00, 2.50 - (mean_tension_pct / 40.0))), 2)
+        short_multiplier = round(max(0.00, min(5.00, 2.50 + (mean_tension_pct / 40.0))), 2)
+        
+        if mean_tension_pct >= 60.0: final_regime = "STRATEGIC OVERVALUATION PEAK (PLAY DEFENSE)"
+        elif mean_tension_pct >= 20.0: final_regime = "UPWARD STRETCH WAVE (TRIM SIZING)"
+        elif mean_tension_pct >= -20.0: final_regime = "BALANCED EQUILIBRIUM COOLDOWN"
+        elif mean_tension_pct >= -60.0: final_regime = "CYCLIC CAPITULATION EXHAUSTION (SCALE UP)"
+        else: final_regime = "EXTREME SELLING EXHAUSTION FLOOR (MAX DEPLOYMENT)"
+        
+        output_data = {
+            "Barometer_Level": [consensus_level], "Regime": [f"{final_regime} ({mean_tension_pct:0.1f}%)"],
+            "Long_Multiplier": [long_multiplier], "Short_Multiplier": [short_multiplier],
+            "Normalization_Lookback": [NORM_WINDOW], "Backtest_Shift_Bars": [SHIFT_BARS], "Effective_Run_Date": [static_dt_str]
+        }
+        gauge_path = os.path.join(MACRO_DIR, "market_pressure_gauge.csv")
+        pd.DataFrame(output_data).to_csv(gauge_path, index=False)
+        
+        print("\n" + "-" * 75)
+        print(f"🏆 Unified Macro Consensus Position (As of {static_dt_str}): {mean_tension_pct:+.1f}%")
+        print(f"📡 Portfolio Defensive Level Stance: {consensus_level:+} | {final_regime}")
+        print(f"📊 Anti-Cyclical Capital Multiplier (long/cover):  {long_multiplier}x")
+        print(f"📉 Anti-Cyclical Capital Multiplier (short/close): {short_multiplier}x")
+        print(f"📊 Metric Ledgers Exported to Folder: {os.path.basename(MACRO_DIR)}")
+        print("-" * 75 + "\n")
+        
+    print("🏆 Master Macro Barometer execution cycle finalized successfully.")
+
+if __name__ == "__main__":
+    run_macro_barometer_pipeline()
