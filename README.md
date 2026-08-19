@@ -43,3 +43,26 @@ source .venv/Scripts/activate
 pip install -r requirements.txt
 python scripts/main.py
 scripts/run_pipeline.bat
+
+
+
+git checkout master
+git merge dev
+git push
+git tag v0.2
+git push origin v0.2
+
+## commit
+
+git status
+git diff --check
+git add scripts/macro_barometer.py
+git diff --cached
+git commit -m "Align OBV extrema signals with TOS behavior"
+git tag -a v.12 -m "Release v.12"
+git push origin dev
+git push origin v.12
+git status
+
+git add scripts/macro_barometer.py requirements.txt
+
