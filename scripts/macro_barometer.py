@@ -11,6 +11,7 @@ import os
 import glob
 import re
 import time
+import traceback
 import argparse
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -146,6 +147,45 @@ def compute_raw_obv_vector(close_series, volume_series):
         
     return pd.Series(obv_array, index=close_series.index)
 
+OBV_PERIODS = {
+    360: "P1",
+    270: "P2",
+    180: "P3",
+    90: "P4",
+    50: "P5",
+}
+
+
+def detect_tos_obv_extrema(raw_obv, end_idx, shift_bars=0):
+    """Match TOS: latest global min/max in each trailing period."""
+    latest_idx = end_idx - 1
+    results = {"min": [], "max": []}
+
+    if latest_idx < 0:
+        return results
+
+    for period, label in OBV_PERIODS.items():
+        window_start = max(0, latest_idx - period)
+        window = raw_obv.iloc[window_start:end_idx]
+
+        if window.empty:
+            continue
+
+        for kind, extreme in (
+            ("min", window.min()),
+            ("max", window.max())
+        ):
+            hits = np.flatnonzero(window.to_numpy() == extreme)
+            if len(hits):
+                idx = window_start + hits[-1]
+                results[kind].append({
+                    "period": label,
+                    "period_bars": period,
+                    "offset": idx - latest_idx - shift_bars,
+                    "value": float(extreme),
+                })
+
+    return results
 
 def calculate_opex_coordinates(df_chart, timeline_x, effective_today_date):
     """Returns historical OpEx lines plus the next two projected OpEx dates."""
@@ -213,34 +253,36 @@ def generate_unified_two_pane_chart(symbol, anchors, consensus_positions, curren
         # --- THE PHYSICAL ACCELERATOR: RAW OBV5 ANALYSIS LOOP ---
         df_p['raw_obv'] = compute_raw_obv_vector(df_p['Close'], df_p['Volume'])
         
-        buy_marker_stack = {}  
+        buy_marker_stack = {}
         sell_marker_stack = {}
-        
+
         end_idx = len(df_p) - SHIFT_BARS
         start_idx = max(0, end_idx - PLOT_RANGE)
-        
-        periods = {90: "P1", 180: "P2", 270: "P3", 360: "P4", 50: "P5"}
-        
-        # SCAN 5-BAR TOLERANCE ZONE BACKWARD FROM TODAY'S HORIZON LINE
-        for bar_offset in range(0, 6):
-            target_idx = end_idx - 1 - bar_offset
-            if target_idx < 360: continue
-            view_x_coord = -(SHIFT_BARS + bar_offset)
-            
-            for length, label in periods.items():
-                lookback_chunk = df_p['raw_obv'].iloc[target_idx - length : target_idx + 1]
-                
-                if df_p['raw_obv'].iloc[target_idx] == lookback_chunk.max():
-                    if view_x_coord not in buy_marker_stack: buy_marker_stack[view_x_coord] = []
-                    if label not in buy_marker_stack[view_x_coord]: buy_marker_stack[view_x_coord].append(label)
-                    
-                if df_p['raw_obv'].iloc[target_idx] == lookback_chunk.min():
-                    if view_x_coord not in sell_marker_stack: sell_marker_stack[view_x_coord] = []
-                    if label not in sell_marker_stack[view_x_coord]: sell_marker_stack[view_x_coord].append(label)
 
         df_slice = df_p.iloc[start_idx:end_idx].copy()
         timeline_x = np.arange(-len(df_slice) + 1, 1) - SHIFT_BARS
-        
+
+        obv_signal_cache = detect_tos_obv_extrema(
+            df_p["raw_obv"],
+            end_idx=end_idx,
+            shift_bars=SHIFT_BARS
+        )
+
+        # TOS semantics:
+        # global minimum = up/accumulation arrow
+        # global maximum = down/distribution arrow
+        for signal in obv_signal_cache["min"]:
+            if -len(df_slice) <= signal["offset"] <= -SHIFT_BARS:
+                buy_marker_stack.setdefault(
+                    signal["offset"], []
+                ).append(signal["period"])
+
+        for signal in obv_signal_cache["max"]:
+            if -len(df_slice) <= signal["offset"] <= -SHIFT_BARS:
+                sell_marker_stack.setdefault(
+                    signal["offset"], []
+                ).append(signal["period"])
+
         g_min_p = df_slice['Close'].min(); g_max_p = df_slice['Close'].max()
         denom_p = g_max_p - g_min_p if (g_max_p - g_min_p) != 0 else 1.0
         df_slice['norm_A'] = SCALE_MIN + ((df_slice['Close'] - g_min_p) / denom_p) * (SCALE_MAX - SCALE_MIN)
@@ -302,16 +344,29 @@ def generate_unified_two_pane_chart(symbol, anchors, consensus_positions, curren
         fig.add_trace(go.Scatter(x=timeline_x, y=df_slice['Close'], name=f"Raw {lbl_sym} Price", line=dict(color='#63E6BE', width=1.0)), row=1, col=1, secondary_y=True)
         
         # Plot Stacked Accumulation Entries
+        # Accumulation / global minimum signals
         for x_pos, hit_labels in buy_marker_stack.items():
             base_y = float(
                 df_slice['norm_A'].iloc[int(x_pos - timeline_x[0])]
             )
             for stack_idx, lbl in enumerate(hit_labels):
                 offset_y = base_y - 0.45 - (stack_idx * 0.40)
+                marker_color = "#00FFFF" if lbl == "P5" else "#00FF66"
+
                 fig.add_trace(go.Scatter(
-                    x=[x_pos], y=[offset_y], mode="markers+text", name=f"Accumulation {lbl}", showlegend=False,
-                    marker=dict(symbol="triangle-up", size=10, color="#00FF66"),
-                    text=f"🟢 {lbl}", textposition="bottom center", textfont=dict(size=9, color="#00FF66")
+                    x=[x_pos],
+                    y=[offset_y],
+                    mode="markers+text",
+                    name=f"Accumulation {lbl}",
+                    showlegend=False,
+                    marker=dict(
+                        symbol="triangle-up",
+                        size=10,
+                        color=marker_color
+                    ),
+                    text=f"{lbl}",
+                    textposition="middle right",
+                    textfont=dict(size=9, color=marker_color)
                 ), row=1, col=1, secondary_y=False)
                 
         # Plot Stacked Distribution Breakdowns
@@ -321,11 +376,16 @@ def generate_unified_two_pane_chart(symbol, anchors, consensus_positions, curren
             )
             for stack_idx, lbl in enumerate(hit_labels):
                 offset_y = base_y + 0.45 + (stack_idx * 0.40)
-                fig.add_trace(go.Scatter(
-                    x=[x_pos], y=[offset_y], mode="markers+text", name=f"Distribution {lbl}", showlegend=False,
-                    marker=dict(symbol="triangle-down", size=10, color="#FF3B30"),
-                    text=f"🔴 {lbl}", textposition="top center", textfont=dict(size=9, color="#FF3B30")
-                ), row=1, col=1, secondary_y=False)
+                marker_color = "#FF9500" if lbl == "P5" else "#FF3B30"
+
+                fig.add_trace(
+                    go.Scatter(
+                        x=[x_pos], y=[offset_y], mode="markers+text", name=f"Distribution {lbl}", showlegend=False,
+                        marker=dict(symbol="triangle-down", size=10, color=marker_color),
+                        text=f"{lbl}", textposition="middle right", textfont=dict(size=9, color=marker_color)
+                    ),
+                    row=1, col=1, secondary_y=False
+                )
         
         # Panel 2 Traces
         fig.add_trace(go.Scatter(x=timeline_x, y=df_slice['vs_vx'], name=f'vs VIX Delta', line=dict(color='#FF9500', width=2.2)), row=2, col=1, secondary_y=False)
@@ -335,7 +395,7 @@ def generate_unified_two_pane_chart(symbol, anchors, consensus_positions, curren
             go.Scatter(
                 x=timeline_x,
                 y=df_slice['norm_OBV_wave'],
-                name="Norma OBV5",
+                name="Norm OBV5",
                 line=dict(
                     color="#4D96FF",
                     width=1.0,
@@ -483,6 +543,7 @@ def generate_unified_two_pane_chart(symbol, anchors, consensus_positions, curren
         consensus_positions.append(float(df_slice['spring'].iloc[-1]))
     except Exception as e:
         print(f"   ⚠️ Visual Engine Exception for {lbl_sym}: {e}")
+        traceback.print_exc()
 
 """
 QUANT TERMINAL - Step 5: Real-Time Multi-Regime Macro Barometer Dashboard
