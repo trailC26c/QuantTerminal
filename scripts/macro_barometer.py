@@ -28,9 +28,9 @@ logging.getLogger('yfinance').setLevel(logging.CRITICAL)
 # 🎛️ COMMAND LINE INTERFACE (CLI) ARGUMENT EXTENSION PARSER
 # =========================================================================
 parser = argparse.ArgumentParser(description="QUANT TERMINAL: Macro Engine")
-parser.add_argument("--window", type=int, default=252, help="Normalization lookback window (default: 252)")
+parser.add_argument("--window", type=int, default=200, help="Normalization lookback window (default: 200)")
 parser.add_argument("--shift", type=int, default=0, help="Mathematical backtest shift (default: 0)")
-parser.add_argument("--range", type=int, default=504, help="Visual plot horizon range in bars (default: 504)")
+parser.add_argument("--range", type=int, default=300, help="Visual plot horizon range in bars (default: 300)")
 parser.add_argument("--scale_min", type=float, default=1.0, help="Lower bound coefficient (default: 1.0)")
 parser.add_argument("--scale_max", type=float, default=11.0, help="Upper bound ceiling coefficient (default: 11.0)")
 
@@ -38,8 +38,19 @@ parser.add_argument("--scale_max", type=float, default=11.0, help="Upper bound c
 parser.add_argument("--mf_window", type=int, default=12, help="Market Forecast intermediate lookback (default: 12)")
 parser.add_argument("--stoch_k", type=int, default=9, help="Stochastic Slow %K channel window (default: 9)")
 parser.add_argument("--stoch_d", type=int, default=5, help="Stochastic Slow %D smoothing filter (default: 5)")
+parser.add_argument(
+    "--mf_stoch",
+    type=int,
+    choices=(0, 1),
+    default=0,
+    help="Plot Market Forecast and Stochastic lines: 1=on, 0=off (default)"
+)
 
-args, unknown = parser.parse_known_args()  
+args, unknown = parser.parse_known_args()
+
+if args.shift < 0:
+    parser.error("--shift must be zero or greater")
+
 NORM_WINDOW = args.window
 SHIFT_BARS = args.shift
 PLOT_RANGE = args.range
@@ -48,6 +59,7 @@ SCALE_MAX = args.scale_max
 MF_WINDOW = args.mf_window
 STOCH_K = args.stoch_k
 STOCH_D = args.stoch_d
+MF_STOCH = args.mf_stoch
 
 # =========================================================================
 # 📂 DIRECTORY STRUCTURE & ROUTING SPECIFICATIONS
@@ -136,29 +148,41 @@ def compute_raw_obv_vector(close_series, volume_series):
 
 
 def calculate_opex_coordinates(df_chart, timeline_x, effective_today_date):
-    """Locates historical OpEx Fridays and projects next two monthly targets."""
-    # 🎯 SHIELD ENGINE: Force string validation up-front to absorb raw datatype drift leaks
-    if hasattr(effective_today_date, 'strftime'):
-        dt_str = effective_today_date.strftime("%Y-%m-%d")
-    else:
-        dt_str = str(effective_today_date).split(' ')[0]
-        
-    eff_dt_obj = datetime.strptime(dt_str, "%Y-%m-%d")
-    
-    opex_x_coords = []
-    unique_months = set()
-    for idx in range(len(df_chart) - 1, -1, -1):
-        row_date = df_chart.index[idx]
-        month_key = f"{row_date.year}-{row_date.month}"
-        if month_key not in unique_months:
-            first_of_month = datetime(row_date.year, row_date.month, 1)
-            first_friday_offset = (4 - first_of_month.weekday()) % 7
-            third_friday = first_of_month + timedelta(days=first_friday_offset + 14)
-            if row_date.date() == third_friday.date() or (row_date.weekday() == 3 and (third_friday.date() - row_date.date()).days == 1):
-                if idx < len(timeline_x):
-                    opex_x_coords.append(timeline_x[idx])
-                    unique_months.add(month_key)
-    return opex_x_coords, 15, 45
+    """Returns historical OpEx lines plus the next two projected OpEx dates."""
+    effective_date = pd.Timestamp(effective_today_date).normalize()
+    chart_dates = pd.DatetimeIndex(df_chart.index).tz_localize(None).normalize()
+    last_chart_date = chart_dates[-1]
+
+    def third_friday(year, month):
+        first_day = pd.Timestamp(year=year, month=month, day=1)
+        return first_day + pd.offsets.Week(weekday=4) + pd.Timedelta(weeks=2)
+
+    historical_x = []
+    for year_month in pd.period_range(
+        chart_dates[0], last_chart_date, freq="M"
+    ):
+        expiry = third_friday(year_month.year, year_month.month)
+        if expiry <= last_chart_date:
+            idx = chart_dates.searchsorted(expiry, side="left")
+            if idx < len(chart_dates):
+                historical_x.append(float(timeline_x[idx]))
+
+    projected_x = []
+    cursor = effective_date.replace(day=1)
+
+    while len(projected_x) < 2:
+        expiry = third_friday(cursor.year, cursor.month)
+
+        if expiry > effective_date:
+            bars_forward = np.busday_count(
+                last_chart_date.date(),
+                expiry.date()
+            )
+            projected_x.append(float(timeline_x[-1] + bars_forward))
+
+        cursor = cursor + pd.offsets.MonthBegin(1)
+
+    return historical_x + projected_x, 15, 45
 """
 QUANT TERMINAL - Step 5: Real-Time Multi-Regime Macro Barometer Dashboard
 Block 3 of 6: Master Charting Data Frame Pre-Processors and Raw OBV Radar Sweeps.
@@ -201,7 +225,7 @@ def generate_unified_two_pane_chart(symbol, anchors, consensus_positions, curren
         for bar_offset in range(0, 6):
             target_idx = end_idx - 1 - bar_offset
             if target_idx < 360: continue
-            view_x_coord = -bar_offset
+            view_x_coord = -(SHIFT_BARS + bar_offset)
             
             for length, label in periods.items():
                 lookback_chunk = df_p['raw_obv'].iloc[target_idx - length : target_idx + 1]
@@ -215,7 +239,7 @@ def generate_unified_two_pane_chart(symbol, anchors, consensus_positions, curren
                     if label not in sell_marker_stack[view_x_coord]: sell_marker_stack[view_x_coord].append(label)
 
         df_slice = df_p.iloc[start_idx:end_idx].copy()
-        timeline_x = np.arange(-len(df_slice), 0)
+        timeline_x = np.arange(-len(df_slice) + 1, 1) - SHIFT_BARS
         
         g_min_p = df_slice['Close'].min(); g_max_p = df_slice['Close'].max()
         denom_p = g_max_p - g_min_p if (g_max_p - g_min_p) != 0 else 1.0
@@ -226,7 +250,7 @@ def generate_unified_two_pane_chart(symbol, anchors, consensus_positions, curren
         raw_obv_wave = min_max_normalize_shifted_series(NORM_WINDOW, SHIFT_BARS, df_slice['raw_obv'])
         
         # Pure amplitude scaling factor right from the absolute zero floor up
-        OBV5_MULTIP = 2.0
+        OBV5_MULTIP = 1.0
         df_slice['norm_OBV_wave'] = raw_obv_wave * OBV5_MULTIP
         
         roll_low = df_slice['Low'].rolling(window=MF_WINDOW, min_periods=1).min()
@@ -262,14 +286,26 @@ def generate_unified_two_pane_chart(symbol, anchors, consensus_positions, curren
         )
         
         # Panel 1 Traces
-        fig.add_trace(go.Scatter(x=timeline_x, y=df_slice['norm_A'], name=lbl_sym, line=dict(color='#00F0FF', width=2.5)), row=1, col=1, secondary_y=False)
+        fig.add_trace(
+            go.Scatter(
+                x=timeline_x,
+                y=df_slice['norm_A'],
+                name=f"norm_{lbl_sym}",
+                line=dict(color='#00F0FF', width=2.5)
+            ),
+            row=1,
+            col=1,
+            secondary_y=False
+        )
         fig.add_trace(go.Scatter(x=timeline_x, y=df_slice['norm_VIX'], name='norm_VIX', line=dict(color='#FF3B30', width=1.5, dash='dot')), row=1, col=1, secondary_y=False)
         fig.add_trace(go.Scatter(x=timeline_x, y=df_slice['norm_UUP'], name='norm_UUP', line=dict(color='#34C759', width=1.5, dash='dot')), row=1, col=1, secondary_y=False)
         fig.add_trace(go.Scatter(x=timeline_x, y=df_slice['Close'], name=f"Raw {lbl_sym} Price", line=dict(color='#63E6BE', width=1.0)), row=1, col=1, secondary_y=True)
         
         # Plot Stacked Accumulation Entries
         for x_pos, hit_labels in buy_marker_stack.items():
-            base_y = float(df_slice['norm_A'].iloc[x_pos])
+            base_y = float(
+                df_slice['norm_A'].iloc[int(x_pos - timeline_x[0])]
+            )
             for stack_idx, lbl in enumerate(hit_labels):
                 offset_y = base_y - 0.45 - (stack_idx * 0.40)
                 fig.add_trace(go.Scatter(
@@ -280,7 +316,9 @@ def generate_unified_two_pane_chart(symbol, anchors, consensus_positions, curren
                 
         # Plot Stacked Distribution Breakdowns
         for x_pos, hit_labels in sell_marker_stack.items():
-            base_y = float(df_slice['norm_A'].iloc[x_pos])
+            base_y = float(
+                df_slice['norm_A'].iloc[int(x_pos - timeline_x[0])]
+            )
             for stack_idx, lbl in enumerate(hit_labels):
                 offset_y = base_y + 0.45 + (stack_idx * 0.40)
                 fig.add_trace(go.Scatter(
@@ -292,49 +330,155 @@ def generate_unified_two_pane_chart(symbol, anchors, consensus_positions, curren
         # Panel 2 Traces
         fig.add_trace(go.Scatter(x=timeline_x, y=df_slice['vs_vx'], name=f'vs VIX Delta', line=dict(color='#FF9500', width=2.2)), row=2, col=1, secondary_y=False)
         fig.add_trace(go.Scatter(x=timeline_x, y=df_slice['vs_uup'], name=f'vs UUP Delta', line=dict(color='#AF52DE', width=2.2)), row=2, col=1, secondary_y=False)
-        fig.add_trace(go.Scatter(x=timeline_x, y=df_slice['spring'], name=f'Spring Tension Velocity', line=dict(color='#00FF66', width=2.5)), row=2, col=1, secondary_y=False)
-        
-        fig.add_trace(go.Scatter(x=timeline_x, y=df_slice['norm_OBV_wave'], name="Normalized OBV5 Wave", line=dict(color='#FFD700', width=2.0)), row=2, col=1, secondary_y=True)
-        fig.add_trace(go.Scatter(x=timeline_x, y=df_slice['market_forecast'], name="TOS Market Forecast (Int)", line=dict(color='#B5179E', width=1.0, dash='dot')), row=2, col=1, secondary_y=True)
-        fig.add_trace(go.Scatter(x=timeline_x, y=df_slice['stoch_delta_wave'], name="Stochastic Slow Delta %K-%D", line=dict(color='#4CC9F0', width=1.0, dash='dot')), row=2, col=1, secondary_y=True)
-        
-        hist_opex_x, n_opex, f_opex = calculate_opex_coordinates(df_slice, timeline_x, current_run_date)
-        for h_x in hist_opex_x:
-            for r in [1,2]: fig.add_vline(x=h_x, line=dict(color='#9B5DE5', width=1.2, dash='dash'), row=r, col=1)
-
-        # Apply left axis title spacing standoffs cleanly
-        fig.update_yaxes(range=[0.5, SCALE_MAX + 1.0], title=dict(text="Regime Normalization Bounds", standoff=12), row=1, col=1, secondary_y=False, gridcolor='#2C2C2E', zerolinecolor='#48484A', showticklabels=True)
-        fig.update_yaxes(title_text="Raw Value Price Axis ($)", row=1, col=1, secondary_y=True, gridcolor='#2C2C2E')
-        fig.update_xaxes(gridcolor='#2C2C2E', row=1, col=1)
-        
-        sub_min_2 = df_slice[['vs_vx', 'vs_uup', 'spring']].min().min()
-        sub_max_2 = df_slice[['vs_vx', 'vs_uup', 'spring']].max().max()
-        span_2 = sub_max_2 - sub_min_2 if (sub_max_2 - sub_min_2) != 0 else 1.0
-        fig.update_yaxes(range=[sub_min_2 - (span_2 * 0.15), sub_max_2 + (span_2 * 0.15)], title=dict(text="Hooke Physics Tension Deltas", standoff=12), row=2, col=1, secondary_y=False, gridcolor='#2C2C2E', zerolinecolor='#48484A', showticklabels=True)
-        fig.update_yaxes(range=[-5.0, 105.0], title_text="Oscillators Percentage Scale (%)", row=2, col=1, secondary_y=True, gridcolor='#2C2C2E')
-        fig.update_xaxes(gridcolor='#2C2C2E', row=2, col=1)
-
-        fig.update_xaxes(showspikes=True, spikethickness=1, spikedash="solid", spikecolor="#A1A1A6", spikemode="across")
-        fig.update_yaxes(showspikes=True, spikethickness=1, spikedash="solid", spikecolor="#A1A1A6", secondary_y=False)
-        fig.update_yaxes(showspikes=True, spikethickness=1, spikedash="solid", spikecolor="#A1A1A6", secondary_y=True)
-
-        # 🎯 FIX PASS EXECUTED: Purges conflicting 'ncols' property completely to unlock unbroken chart rendering
-        fig.update_layout(
-            title=dict(text=f"📡 QUANT MATRIX TERMINAL: {lbl_sym} ADVANCED PROFILE", font=dict(size=16, color='#FFFFFF'), x=0.5, xanchor='center'),
-            template="plotly_dark", paper_bgcolor='#1C1C1E', plot_bgcolor='#1C1C1E',
-            height=1200, width=950, margin=dict(l=100, r=80, t=100, b=50),
-            showlegend=True, 
-            legend=dict(
-                orientation="h", yanchor="bottom", y=1.01, xanchor="center", x=0.5,
-                font=dict(size=9, color="#D1D1D6")
+        fig.add_trace(go.Scatter(x=timeline_x, y=df_slice['spring'], name=f'vs SMA Delta (spring ext.)', line=dict(color='#00FF66', width=2.5)), row=2, col=1, secondary_y=False)
+        fig.add_trace(
+            go.Scatter(
+                x=timeline_x,
+                y=df_slice['norm_OBV_wave'],
+                name="Norma OBV5",
+                line=dict(
+                    color="#4D96FF",
+                    width=1.0,
+                    dash="dot"
+                )
             ),
-            hovermode="x unified",
-            hoverlabel=dict(bgcolor="rgba(28, 28, 30, 0.65)", bordercolor="rgba(85, 85, 85, 0.50)", font=dict(size=12, color="#FFFFFF"))
+            row=2,
+            col=1,
+            secondary_y=True
         )
-        
-        dt_file_lbl = current_run_date.strftime("%Y-%m-%d") if hasattr(current_run_date, 'strftime') else str(current_run_date).split(' ')
+        if MF_STOCH == 1:
+            fig.add_trace(
+                go.Scatter(
+                    x=timeline_x,
+                    y=df_slice['market_forecast'],
+                    name="TOS Market Forecast (Int)",
+                    line=dict(color='#B5179E', width=1.0, dash='dot')
+                ),
+                row=2,
+                col=1,
+                secondary_y=True
+            )
+            fig.add_trace(
+                go.Scatter(
+                    x=timeline_x,
+                    y=df_slice['stoch_delta_wave'],
+                    name="Stochastic Slow Delta %K-%D",
+                    line=dict(color='#4CC9F0', width=1.0, dash='dot')
+                ),
+                row=2,
+                col=1,
+                secondary_y=True
+            )
+        hist_opex_x, n_opex, f_opex = calculate_opex_coordinates(
+            df_slice, timeline_x, current_run_date
+        )
+        for h_x in hist_opex_x:
+            for r in [1, 2]:
+                fig.add_vline(
+                    x=h_x,
+                    line=dict(color="#9B5DE5", width=1.2, dash="dash"),
+                    row=r,
+                    col=1
+                )
+
+        # Restore the dark, wide, two-panel dashboard layout.
+        fig.update_layout(
+            template="plotly_dark",
+            paper_bgcolor="#1C1C1E",
+            plot_bgcolor="#1C1C1E",
+            height=1200,
+            width=1100,
+            margin=dict(l=100, r=80, t=110, b=50),
+            title=dict(
+                text=f"📡 QUANT MATRIX TERMINAL: {lbl_sym} ADVANCED PROFILE",
+                font=dict(size=16, color="#FFFFFF"),
+                x=0.5,
+                y=0.995,
+                xanchor="center",
+                yanchor="top"
+            ),
+            showlegend=True,
+            legend=dict(
+                orientation="h",
+                yanchor="top",
+                y=1.08,
+                xanchor="center",
+                x=0.5,
+                font=dict(size=10, color="#D1D1D6")
+            ),
+            yaxis=dict(title_text="Norm Asset/VIX/UUP"),
+            yaxis2=dict(title_text="Raw Asset price ($)"),
+            yaxis3=dict(title_text="Delta Norm Asset to Norm VIX/UUP"),
+            yaxis4=dict(title_text="Norm OBV (range)"),
+            hovermode="x unified",
+            font=dict(color="#FFFFFF")
+        )
+
+        # Add synchronized crosshair segments to both panels.
+        fig.add_shape(
+            type="line",
+            x0=0, x1=0, y0=0, y1=1,
+            xref="x", yref="y domain",
+            line=dict(
+                color="rgba(255,255,255,0.35)",
+                width=1.0,
+                dash="dot"
+            ),
+            opacity=0
+        )
+        fig.add_shape(
+            type="line",
+            x0=0, x1=0, y0=0, y1=1,
+            xref="x", yref="y3 domain",
+            line=dict(
+                color="rgba(255,255,255,0.35)",
+                width=1.0,
+                dash="dot"
+            ),
+            opacity=0
+        )
+
+        shape_1 = len(fig.layout.shapes) - 2
+        shape_2 = len(fig.layout.shapes) - 1
+
+        post_script = f"""
+        const gd = document.getElementById('{{plot_id}}');
+
+        gd.on('plotly_hover', function(eventData) {{
+            if (!eventData.points || !eventData.points.length) return;
+
+            const x = eventData.points[0].x;
+            const update = {{}};
+
+            for (const i of [{shape_1}, {shape_2}]) {{
+                update[`shapes[${{i}}].x0`] = x;
+                update[`shapes[${{i}}].x1`] = x;
+                update[`shapes[${{i}}].opacity`] = 1;
+            }}
+
+            Plotly.relayout(gd, update);
+        }});
+
+        gd.on('plotly_unhover', function() {{
+            Plotly.relayout(gd, {{
+                'shapes[{shape_1}].opacity': 0,
+                'shapes[{shape_2}].opacity': 0
+            }});
+        }});
+        """
+
+        dt_file_lbl = (
+            current_run_date.strftime("%Y-%m-%d")
+            if hasattr(current_run_date, "strftime")
+            else str(current_run_date).split(" ")[0]
+        )
         out_name = f"{dt_file_lbl}_{lbl_sym}_BAROMETER.html"
-        fig.write_html(os.path.join(CHARTS_DIR, out_name), include_plotlyjs='inline')
+
+        fig.write_html(
+            os.path.join(CHARTS_DIR, out_name),
+            include_plotlyjs="inline",
+            post_script=post_script
+        )
         print(f"   ✨ Unified Portrait Canvas Compiled Successfully -> {out_name}")
         consensus_positions.append(float(df_slice['spring'].iloc[-1]))
     except Exception as e:
@@ -418,7 +562,7 @@ def run_macro_barometer_pipeline():
                     current_obv += float(df_m['Volume'].iloc[i])
                 elif df_m['Close'].iloc[i] < df_m['Close'].iloc[i-1]:
                     current_obv -= float(df_m['Volume'].iloc[i])
-                df_m['raw_obv'].iloc[i] = current_obv
+                df_m.loc[df_m.index[i], 'raw_obv'] = current_obv
                 
             df_m['norm_A'] = min_max_normalize_shifted_series(NORM_WINDOW, SHIFT_BARS, df_m['Close'])
             df_m['sma_r'] = df_m['Close'].rolling(window=NORM_WINDOW, min_periods=1).mean()
