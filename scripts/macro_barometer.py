@@ -30,7 +30,12 @@ logging.getLogger('yfinance').setLevel(logging.CRITICAL)
 # =========================================================================
 parser = argparse.ArgumentParser(description="QUANT TERMINAL: Macro Engine")
 parser.add_argument("--window", type=int, default=200, help="Normalization lookback window (default: 200)")
-parser.add_argument("--shift", type=int, default=0, help="Mathematical backtest shift (default: 0)")
+parser.add_argument(
+    "--shift",
+    type=int,
+    default=0,
+    help="Mathematical backtest shift; positive or negative N evaluates N bars back (default: 0)"
+)
 parser.add_argument("--range", type=int, default=300, help="Visual plot horizon range in bars (default: 300)")
 parser.add_argument("--scale_min", type=float, default=1.0, help="Lower bound coefficient (default: 1.0)")
 parser.add_argument("--scale_max", type=float, default=11.0, help="Upper bound ceiling coefficient (default: 11.0)")
@@ -46,14 +51,18 @@ parser.add_argument(
     default=0,
     help="Plot Market Forecast and Stochastic lines: 1=on, 0=off (default)"
 )
+parser.add_argument(
+    "--obv5_detailed",
+    type=int,
+    choices=(0, 1),
+    default=1,
+    help="Stitch P4/P5 OBV extrema scans across recent blocks: 1=on, 0=off (default: on)"
+)
 
 args, unknown = parser.parse_known_args()
 
-if args.shift < 0:
-    parser.error("--shift must be zero or greater")
-
 NORM_WINDOW = args.window
-SHIFT_BARS = args.shift
+SHIFT_BARS = abs(args.shift)
 PLOT_RANGE = args.range
 SCALE_MIN = args.scale_min
 SCALE_MAX = args.scale_max
@@ -61,6 +70,7 @@ MF_WINDOW = args.mf_window
 STOCH_K = args.stoch_k
 STOCH_D = args.stoch_d
 MF_STOCH = args.mf_stoch
+OBV5_DETAILED = args.obv5_detailed
 
 # =========================================================================
 # 📂 DIRECTORY STRUCTURE & ROUTING SPECIFICATIONS
@@ -156,7 +166,7 @@ OBV_PERIODS = {
 }
 
 
-def detect_tos_obv_extrema(raw_obv, end_idx, shift_bars=0):
+def detect_tos_obv_extrema(raw_obv, end_idx, shift_bars=0, detailed=False):
     """Match TOS: latest global min/max in each trailing period."""
     latest_idx = end_idx - 1
     results = {"min": [], "max": []}
@@ -165,25 +175,36 @@ def detect_tos_obv_extrema(raw_obv, end_idx, shift_bars=0):
         return results
 
     for period, label in OBV_PERIODS.items():
-        window_start = max(0, latest_idx - period)
-        window = raw_obv.iloc[window_start:end_idx]
+        segment_offsets = (0,)
+        if detailed and period == 90:
+            segment_offsets = (0, 90, 180)
+        elif detailed and period == 50:
+            segment_offsets = (0, 50, 100, 150, 200)
 
-        if window.empty:
-            continue
+        for segment_offset in segment_offsets:
+            window_end = end_idx - segment_offset
+            if window_end <= 0:
+                continue
 
-        for kind, extreme in (
-            ("min", window.min()),
-            ("max", window.max())
-        ):
-            hits = np.flatnonzero(window.to_numpy() == extreme)
-            if len(hits):
-                idx = window_start + hits[-1]
-                results[kind].append({
-                    "period": label,
-                    "period_bars": period,
-                    "offset": idx - latest_idx - shift_bars,
-                    "value": float(extreme),
-                })
+            window_start = max(0, window_end - period)
+            window = raw_obv.iloc[window_start:window_end]
+
+            if window.empty:
+                continue
+
+            for kind, extreme in (
+                ("min", window.min()),
+                ("max", window.max())
+            ):
+                hits = np.flatnonzero(window.to_numpy() == extreme)
+                if len(hits):
+                    idx = window_start + hits[-1]
+                    results[kind].append({
+                        "period": label,
+                        "period_bars": period,
+                        "offset": idx - latest_idx - shift_bars,
+                        "value": float(extreme),
+                    })
 
     return results
 
@@ -265,7 +286,8 @@ def generate_unified_two_pane_chart(symbol, anchors, consensus_positions, curren
         obv_signal_cache = detect_tos_obv_extrema(
             df_p["raw_obv"],
             end_idx=end_idx,
-            shift_bars=SHIFT_BARS
+            shift_bars=SHIFT_BARS,
+            detailed=OBV5_DETAILED == 1
         )
 
         # TOS semantics:
@@ -395,11 +417,11 @@ def generate_unified_two_pane_chart(symbol, anchors, consensus_positions, curren
             go.Scatter(
                 x=timeline_x,
                 y=df_slice['norm_OBV_wave'],
-                name="Norm OBV5",
+                name="norm OBV5",
                 line=dict(
                     color="#4D96FF",
                     width=1.0,
-                    dash="dot"
+                    dash="solid"
                 )
             ),
             row=2,
@@ -436,7 +458,7 @@ def generate_unified_two_pane_chart(symbol, anchors, consensus_positions, curren
             for r in [1, 2]:
                 fig.add_vline(
                     x=h_x,
-                    line=dict(color="#9B5DE5", width=1.2, dash="dash"),
+                    line=dict(color="#9B5DE5", width=1.2, dash="dot"),
                     row=r,
                     col=1
                 )
@@ -599,7 +621,7 @@ def run_macro_barometer_pipeline():
     ledger_rows = []
     breadth_tension_pool = []
     
-    obv4_periods = {90: "P1", 180: "P2", 270: "P3", 360: "P4"}
+    obv4_periods = {90: "P4", 180: "P3", 270: "P2", 360: "P1"}
     
     # 🎯 SHIELD PASS: Capture immutable baseline text token to immunize lookups
     static_dt_str = datetime.now().strftime("%Y-%m-%d")
