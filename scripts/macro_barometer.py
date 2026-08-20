@@ -29,14 +29,14 @@ logging.getLogger('yfinance').setLevel(logging.CRITICAL)
 # 🎛️ COMMAND LINE INTERFACE (CLI) ARGUMENT EXTENSION PARSER
 # =========================================================================
 parser = argparse.ArgumentParser(description="QUANT TERMINAL: Macro Engine")
-parser.add_argument("--window", type=int, default=200, help="Normalization lookback window (default: 200)")
+parser.add_argument("--window", type=int, default=252, help="Normalization lookback window (default: 252)")
 parser.add_argument(
     "--shift",
     type=int,
     default=0,
     help="Mathematical backtest shift; positive or negative N evaluates N bars back (default: 0)"
 )
-parser.add_argument("--range", type=int, default=300, help="Visual plot horizon range in bars (default: 300)")
+parser.add_argument("--range", type=int, default=400, help="Visual plot horizon range in bars (default: 400)")
 parser.add_argument("--scale_min", type=float, default=1.0, help="Lower bound coefficient (default: 1.0)")
 parser.add_argument("--scale_max", type=float, default=11.0, help="Upper bound ceiling coefficient (default: 11.0)")
 
@@ -58,8 +58,24 @@ parser.add_argument(
     default=1,
     help="Stitch P4/P5 OBV extrema scans across recent blocks: 1=on, 0=off (default: on)"
 )
+parser.add_argument(
+    "--price_candlestick",
+    type=int,
+    choices=(0, 1),
+    default=1,
+    help="Plot raw price as OHLC candlesticks: 1=on, 0=off (default)"
+)
+parser.add_argument(
+    "--obv5_recent_bars",
+    type=int,
+    default=20,
+    help="Recent P4/P5 focus bars: 0=off (default: 20)"
+)
 
 args, unknown = parser.parse_known_args()
+
+if args.obv5_recent_bars < 0:
+    parser.error("--obv5_recent_bars must be zero or greater")
 
 NORM_WINDOW = args.window
 SHIFT_BARS = abs(args.shift)
@@ -71,6 +87,8 @@ STOCH_K = args.stoch_k
 STOCH_D = args.stoch_d
 MF_STOCH = args.mf_stoch
 OBV5_DETAILED = args.obv5_detailed
+PRICE_CANDLESTICK = args.price_candlestick
+RECENT_OBV_SIGNAL_BARS = args.obv5_recent_bars
 
 # =========================================================================
 # 📂 DIRECTORY STRUCTURE & ROUTING SPECIFICATIONS
@@ -164,6 +182,47 @@ OBV_PERIODS = {
     90: "P4",
     50: "P5",
 }
+OBV_SIGNAL_TOLERANCE = 3
+
+
+def consolidate_obv_signals(results, tolerance=OBV_SIGNAL_TOLERANCE):
+    """Collapse nearby same-direction extrema while preserving alternating turns."""
+    consolidated = {"min": [], "max": []}
+
+    periods = sorted({
+        item["period"]
+        for kind in ("min", "max")
+        for item in results[kind]
+    })
+
+    for period in periods:
+        for kind in ("min", "max"):
+            directional = sorted(
+                (item for item in results[kind] if item["period"] == period),
+                key=lambda item: item["offset"]
+            )
+            cluster = []
+
+            def keep_representative(signals):
+                if kind == "min":
+                    return min(signals, key=lambda item: (item["value"], -item["offset"]))
+                return max(signals, key=lambda item: (item["value"], -item["offset"]))
+
+            for signal in directional:
+                if cluster and signal["offset"] - cluster[-1]["offset"] <= tolerance:
+                    cluster.append(signal)
+                else:
+                    if cluster:
+                        consolidated[kind].append(keep_representative(cluster))
+                    cluster = [signal]
+
+            if cluster:
+                consolidated[kind].append(keep_representative(cluster))
+
+    for kind in ("min", "max"):
+        consolidated[kind].sort(key=lambda item: item["offset"])
+
+    return consolidated
 
 
 def detect_tos_obv_extrema(raw_obv, end_idx, shift_bars=0, detailed=False):
@@ -206,7 +265,57 @@ def detect_tos_obv_extrema(raw_obv, end_idx, shift_bars=0, detailed=False):
                         "value": float(extreme),
                     })
 
-    return results
+    if detailed:
+        recent_start = max(0, latest_idx - RECENT_OBV_SIGNAL_BARS + 1)
+        for period, label in ((90, "P4"), (50, "P5")):
+            for target_idx in range(recent_start, latest_idx + 1):
+                window_start = max(0, target_idx - period + 1)
+                window = raw_obv.iloc[window_start:target_idx + 1]
+                if window.empty:
+                    continue
+
+                target_value = float(raw_obv.iloc[target_idx])
+                for kind, extreme in (("min", window.min()), ("max", window.max())):
+                    if target_value != float(extreme):
+                        continue
+
+                    offset = target_idx - latest_idx - shift_bars
+                    prior_same_kind = any(
+                        item["period"] == label and item["offset"] == offset
+                        for item in results[kind]
+                    )
+                    if not prior_same_kind:
+                        results[kind].append({
+                            "period": label,
+                            "period_bars": period,
+                            "offset": offset,
+                            "value": target_value,
+                        })
+
+        for target_idx in range(recent_start + 1, latest_idx):
+            previous_value = float(raw_obv.iloc[target_idx - 1])
+            target_value = float(raw_obv.iloc[target_idx])
+            next_value = float(raw_obv.iloc[target_idx + 1])
+            turn_candidates = []
+            if target_value > previous_value and target_value >= next_value:
+                turn_candidates.append(("max", target_value))
+            if target_value < previous_value and target_value <= next_value:
+                turn_candidates.append(("min", target_value))
+
+            for kind, value in turn_candidates:
+                offset = target_idx - latest_idx - shift_bars
+                if not any(
+                    item["period"] == "P5" and item["offset"] == offset
+                    for item in results[kind]
+                ):
+                    results[kind].append({
+                        "period": "P5",
+                        "period_bars": 50,
+                        "offset": offset,
+                        "value": value,
+                    })
+
+    return consolidate_obv_signals(results)
 
 def calculate_opex_coordinates(df_chart, timeline_x, effective_today_date):
     """Returns historical OpEx lines plus the next two projected OpEx dates."""
@@ -257,15 +366,17 @@ def generate_unified_two_pane_chart(symbol, anchors, consensus_positions, curren
     
     try:
         # Pull 6 years of deep history to provide complete lookback cushions
-        px_raw = yf.download(tick_lookup, period="6y", progress=False)
+        px_raw = yf.download(tick_lookup, period="6y", auto_adjust=False, progress=False)
         close_ser = px_raw['Close'].iloc[:, 0] if isinstance(px_raw['Close'], pd.DataFrame) else px_raw['Close']
         vol_ser = px_raw['Volume'].iloc[:, 0] if isinstance(px_raw['Volume'], pd.DataFrame) else px_raw['Volume']
+        open_ser = px_raw['Open'].iloc[:, 0] if isinstance(px_raw['Open'], pd.DataFrame) else px_raw['Open']
         high_ser = px_raw['High'].iloc[:, 0] if isinstance(px_raw['High'], pd.DataFrame) else px_raw['High']
         low_ser = px_raw['Low'].iloc[:, 0] if isinstance(px_raw['Low'], pd.DataFrame) else px_raw['Low']
         
         df_p = pd.DataFrame(index=close_ser.index)
         df_p['Close'] = close_ser
         df_p['Volume'] = vol_ser
+        df_p['Open'] = open_ser
         df_p['High'] = high_ser
         df_p['Low'] = low_ser
         df_p.index = df_p.index.tz_localize(None)
@@ -308,6 +419,7 @@ def generate_unified_two_pane_chart(symbol, anchors, consensus_positions, curren
         g_min_p = df_slice['Close'].min(); g_max_p = df_slice['Close'].max()
         denom_p = g_max_p - g_min_p if (g_max_p - g_min_p) != 0 else 1.0
         df_slice['norm_A'] = SCALE_MIN + ((df_slice['Close'] - g_min_p) / denom_p) * (SCALE_MAX - SCALE_MIN)
+        normalize_price = lambda price_series: SCALE_MIN + ((price_series - g_min_p) / denom_p) * (SCALE_MAX - SCALE_MIN)
 
 
         # --- ADVANCED PANEL 2 INDEPENDENT INDICATOR PIPELINES ---
@@ -345,22 +457,45 @@ def generate_unified_two_pane_chart(symbol, anchors, consensus_positions, curren
         # FIX PASS INITIALIZATION KEY: Enforces absolute dual-Y channel readiness across both panels
         fig = make_subplots(
             rows=2, cols=1, shared_xaxes=True, vertical_spacing=0.05,
+            row_heights=[0.6, 0.4],
             specs=[[{"secondary_y": True}], [{"secondary_y": True}]],
             subplot_titles=(f"PANEL 1: CORE RECONCILED PROFILE ({lbl_sym})", f"PANEL 2: HOOKE'S LAW RISK MATRIX FACTOR OVERLAYS FOR {lbl_sym}")
         )
         
         # Panel 1 Traces
-        fig.add_trace(
-            go.Scatter(
-                x=timeline_x,
-                y=df_slice['norm_A'],
-                name=f"norm_{lbl_sym}",
-                line=dict(color='#00F0FF', width=2.5)
-            ),
-            row=1,
-            col=1,
-            secondary_y=False
-        )
+        if PRICE_CANDLESTICK == 1:
+            fig.add_trace(
+                go.Candlestick(
+                    x=timeline_x.tolist(),
+                    open=normalize_price(df_slice['Open']).tolist(),
+                    high=normalize_price(df_slice['High']).tolist(),
+                    low=normalize_price(df_slice['Low']).tolist(),
+                    close=normalize_price(df_slice['Close']).tolist(),
+                    name=f"norm_{lbl_sym} OHLC",
+                    increasing_line_color="#00FF66",
+                    increasing_line_width=1.0,
+                    increasing_fillcolor="rgba(0,0,0,0)",
+                    decreasing_line_color="#FF3B30",
+                    decreasing_line_width=1.0,
+                    decreasing_fillcolor="#FF3B30",
+                    showlegend=True
+                ),
+                row=1,
+                col=1,
+                secondary_y=False
+            )
+        else:
+            fig.add_trace(
+                go.Scatter(
+                    x=timeline_x,
+                    y=df_slice['norm_A'],
+                    name=f"norm_{lbl_sym}",
+                    line=dict(color='#00F0FF', width=2.5)
+                ),
+                row=1,
+                col=1,
+                secondary_y=False
+            )
         fig.add_trace(go.Scatter(x=timeline_x, y=df_slice['norm_VIX'], name='norm_VIX', line=dict(color='#FF3B30', width=1.5, dash='dot')), row=1, col=1, secondary_y=False)
         fig.add_trace(go.Scatter(x=timeline_x, y=df_slice['norm_UUP'], name='norm_UUP', line=dict(color='#34C759', width=1.5, dash='dot')), row=1, col=1, secondary_y=False)
         fig.add_trace(go.Scatter(x=timeline_x, y=df_slice['Close'], name=f"Raw {lbl_sym} Price", line=dict(color='#63E6BE', width=1.0)), row=1, col=1, secondary_y=True)
@@ -463,13 +598,37 @@ def generate_unified_two_pane_chart(symbol, anchors, consensus_positions, curren
                     col=1
                 )
 
+        bar_date_lookup = {
+            float(bar_x): bar_date.strftime("%Y-%m-%d")
+            for bar_x, bar_date in zip(timeline_x, df_slice.index)
+        }
+        for trace in fig.data:
+            if trace.x is None:
+                continue
+            trace.customdata = [
+                bar_date_lookup.get(float(bar_x), "")
+                for bar_x in trace.x
+            ]
+            if trace.type == "candlestick":
+                trace.hovertemplate = (
+                    "%{x} (%{customdata})<br>"
+                    "%{fullData.name}<br>"
+                    "Open: %{open}<br>High: %{high}<br>"
+                    "Low: %{low}<br>Close: %{close}<extra></extra>"
+                )
+            else:
+                trace.hovertemplate = (
+                    "%{x} (%{customdata})<br>"
+                    "%{fullData.name}: %{y}<extra></extra>"
+                )
+
         # Restore the dark, wide, two-panel dashboard layout.
         fig.update_layout(
             template="plotly_dark",
             paper_bgcolor="#1C1C1E",
             plot_bgcolor="#1C1C1E",
             height=1200,
-            width=1100,
+            width=1400,
             margin=dict(l=100, r=80, t=110, b=50),
             title=dict(
                 text=f"📡 QUANT MATRIX TERMINAL: {lbl_sym} ADVANCED PROFILE",
@@ -492,6 +651,12 @@ def generate_unified_two_pane_chart(symbol, anchors, consensus_positions, curren
             yaxis2=dict(title_text="Raw Asset price ($)"),
             yaxis3=dict(title_text="Delta Norm Asset to Norm VIX/UUP"),
             yaxis4=dict(title_text="Norm OBV (range)"),
+            xaxis=dict(
+                type="linear",
+                range=[max(-PLOT_RANGE, timeline_x[0]), timeline_x[-1]],
+                rangeslider=dict(visible=False)
+            ),
+            xaxis2=dict(type="linear"),
             hovermode="x unified",
             font=dict(color="#FFFFFF")
         )
@@ -530,6 +695,7 @@ def generate_unified_two_pane_chart(symbol, anchors, consensus_positions, curren
             if (!eventData.points || !eventData.points.length) return;
 
             const x = eventData.points[0].x;
+            const barDate = eventData.points[0].customdata;
             const update = {{}};
 
             for (const i of [{shape_1}, {shape_2}]) {{
@@ -539,6 +705,16 @@ def generate_unified_two_pane_chart(symbol, anchors, consensus_positions, curren
             }}
 
             Plotly.relayout(gd, update);
+
+            if (barDate) {{
+                setTimeout(() => {{
+                    gd.querySelectorAll('.axistext').forEach((axisLabel) => {{
+                        if (axisLabel.textContent.trim() === String(x)) {{
+                            axisLabel.textContent = `${{x}} (${{barDate}})`;
+                        }}
+                    }});
+                }}, 0);
+            }}
         }});
 
         gd.on('plotly_unhover', function() {{
@@ -585,8 +761,8 @@ def run_macro_barometer_pipeline():
     index_symbols, alpha_singles = parse_telemetry_config()
     
     print("📡 Ingesting Risk Anchors (^VIX, UUP) from yfinance...")
-    vix_df = yf.download('^VIX', period="6y", progress=False)
-    uup_df = yf.download('UUP', period="6y", progress=False)
+    vix_df = yf.download('^VIX', period="6y", auto_adjust=False, progress=False)
+    uup_df = yf.download('UUP', period="6y", auto_adjust=False, progress=False)
     
     ser_vix = vix_df['Close'].iloc[:, 0] if isinstance(vix_df['Close'], pd.DataFrame) else vix_df['Close']
     ser_uup = uup_df['Close'].iloc[:, 0] if isinstance(uup_df['Close'], pd.DataFrame) else uup_df['Close']
@@ -628,7 +804,7 @@ def run_macro_barometer_pipeline():
     
     for tick in core_equity_anchors:
         try:
-            raw_px = yf.download(tick, period="6y", progress=False)
+            raw_px = yf.download(tick, period="6y", auto_adjust=False, progress=False)
             close_ser = raw_px['Close'].iloc[:, 0] if isinstance(raw_px['Close'], pd.DataFrame) else raw_px['Close']
             vol_ser = raw_px['Volume'].iloc[:, 0] if isinstance(raw_px['Volume'], pd.DataFrame) else raw_px['Volume']
             
