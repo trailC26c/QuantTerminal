@@ -41,6 +41,11 @@ parser.add_argument(
 parser.add_argument("--range", type=int, default=400, help="Visual plot horizon range in bars (default: 400)")
 parser.add_argument("--scale_min", type=float, default=1.0, help="Lower bound coefficient (default: 1.0)")
 parser.add_argument("--scale_max", type=float, default=11.0, help="Upper bound ceiling coefficient (default: 11.0)")
+parser.add_argument(
+    "--debug_chart",
+    action="store_true",
+    help="Write per-chart Panel 1 diagnostic JSON files (default: off)"
+)
 
 # OSCILLATOR LOOKBACK SWITCHES
 parser.add_argument("--mf_window", type=int, default=12, help="Market Forecast intermediate lookback (default: 12)")
@@ -136,6 +141,9 @@ def parse_telemetry_config():
                 continue
             elif line_str == "[ALPHA_SINGLES]":
                 current_section = "ALPHA"
+                continue
+            elif line_str == "[POSITIONS]":
+                current_section = None
                 continue
             
             tokens = [t.strip().upper() for t in line_str.split(',') if t.strip()]
@@ -395,6 +403,10 @@ def generate_unified_two_pane_chart(symbol, anchors, consensus_positions, curren
         df_p['Low'] = low_ser
         df_p.index = df_p.index.tz_localize(None)
         df_p = df_p.join(anchors, how='inner').dropna()
+
+        if df_p.empty:
+            print(f"   ⚠️ No overlapping market data available for {lbl_sym}; skipping chart.")
+            return
         
         # --- THE PHYSICAL ACCELERATOR: RAW OBV5 ANALYSIS LOOP ---
         df_p['raw_obv'] = compute_raw_obv_vector(df_p['Close'], df_p['Volume'])
@@ -406,6 +418,9 @@ def generate_unified_two_pane_chart(symbol, anchors, consensus_positions, curren
         start_idx = max(0, end_idx - PLOT_RANGE)
 
         df_slice = df_p.iloc[start_idx:end_idx].copy()
+        if df_slice.empty:
+            print(f"   ⚠️ No chartable rows available for {lbl_sym}; skipping chart.")
+            return
         timeline_x = np.arange(-len(df_slice) + 1, 1) - SHIFT_BARS
 
         obv_signal_cache = detect_tos_obv_extrema(
@@ -589,7 +604,7 @@ def generate_unified_two_pane_chart(symbol, anchors, consensus_positions, curren
         # Panel 2 Traces
         fig.add_trace(go.Scatter(x=x_vals, y=df_slice['vs_vx'].tolist(), name=f'vs VIX Delta', line=dict(color='#FF9500', width=2.2)), row=2, col=1, secondary_y=False)
         fig.add_trace(go.Scatter(x=x_vals, y=df_slice['vs_uup'].tolist(), name=f'vs UUP Delta', line=dict(color='#AF52DE', width=2.2)), row=2, col=1, secondary_y=False)
-        fig.add_trace(go.Scatter(x=x_vals, y=df_slice['spring'].tolist(), name=f'vs SMA Delta (spring ext.)', line=dict(color='#00FF66', width=2.5)), row=2, col=1, secondary_y=False)
+        fig.add_trace(go.Scatter(x=x_vals, y=df_slice['spring'].tolist(), name=f'vs SMA Delta', line=dict(color='#00FF66', width=2.5)), row=2, col=1, secondary_y=False)
         fig.add_trace(
             go.Scatter(
                 x=x_vals,
@@ -1273,24 +1288,25 @@ def generate_unified_two_pane_chart(symbol, anchors, consensus_positions, curren
         )
 
         debug_path = f"{output_chart_path}.panel1-debug.json"
-        with open(debug_path, "w", encoding="utf-8") as debug_file:
-            json.dump({
-                "symbol": lbl_sym,
-                "rows": int(len(df_slice)),
-                "timeline_length": int(len(timeline_x)),
-                "panel_1_trace_count": int(panel_1_trace_count),
-                "traces": panel_1_debug,
-            }, debug_file, indent=2)
+        if args.debug_chart:
+            with open(debug_path, "w", encoding="utf-8") as debug_file:
+                json.dump({
+                    "symbol": lbl_sym,
+                    "rows": int(len(df_slice)),
+                    "timeline_length": int(len(timeline_x)),
+                    "panel_1_trace_count": int(panel_1_trace_count),
+                    "traces": panel_1_debug,
+                }, debug_file, indent=2)
 
-            dual_html = pio.to_html(
-                fig,
-                full_html=False,
-                include_plotlyjs="inline",
-                post_script=post_script
-            )
-            panel_1_html = pio.to_html(panel_1_fig, full_html=False, include_plotlyjs=False)
-            panel_2_html = pio.to_html(panel_2_fig, full_html=False, include_plotlyjs=False)
-            tabbed_html = f"""<!doctype html>
+        dual_html = pio.to_html(
+            fig,
+            full_html=False,
+            include_plotlyjs="inline",
+            post_script=post_script
+        )
+        panel_1_html = pio.to_html(panel_1_fig, full_html=False, include_plotlyjs=False)
+        panel_2_html = pio.to_html(panel_2_fig, full_html=False, include_plotlyjs=False)
+        tabbed_html = f"""<!doctype html>
 <html>
 <head><meta charset="utf-8"><title>QUANT MATRIX TERMINAL: {lbl_sym}</title>
 <style>
@@ -1325,7 +1341,8 @@ document.querySelectorAll('.qt-tab').forEach((tab) => tab.addEventListener('clic
             chart_file.write(tabbed_html)
         print(f"   ✨ Unified Portrait Canvas Compiled Successfully -> {out_name}")
         print(f"      📂 Chart path: {output_chart_path}")
-        print(f"      🔎 Panel 1 diagnostics: {debug_path}")
+        if args.debug_chart:
+            print(f"      🔎 Panel 1 diagnostics: {debug_path}")
         consensus_positions.append(float(df_slice['spring'].iloc[-1]))
     except Exception as e:
         print(f"   ⚠️ Visual Engine Exception for {lbl_sym}: {e}")

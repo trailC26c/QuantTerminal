@@ -66,3 +66,10 @@ git status
 
 git add scripts/macro_barometer.py requirements.txt
 
+git status
+git add README.md
+git commit -m "Document project workflow"
+git push origin dev
+
+git log -3 --oneline
+git status
