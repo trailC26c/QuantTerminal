@@ -11,6 +11,7 @@ import os
 import glob
 import re
 import time
+import json
 import traceback
 import argparse
 from datetime import datetime, timedelta
@@ -19,6 +20,7 @@ import pandas as pd
 import numpy as np
 import yfinance as yf
 import plotly.graph_objects as go
+import plotly.io as pio
 from plotly.subplots import make_subplots
 
 # Silence yfinance terminal internal data warnings
@@ -95,8 +97,13 @@ RECENT_OBV_SIGNAL_BARS = args.obv5_recent_bars
 # =========================================================================
 BASE_DIR = r"C:\Users\tcnet\TOS_Data_Local"
 WATCHLIST_DIR = os.path.join(BASE_DIR, "sanitized_watchlists")
-MACRO_DIR = os.path.join(BASE_DIR, "macro_barometer")
-CHARTS_DIR = os.path.join(MACRO_DIR, "charts")
+
+PROJECT_DIR = Path(__file__).resolve().parents[1]
+OUTPUT_DIR = str(PROJECT_DIR / "output")
+MACRO_DIR = OUTPUT_DIR
+CHARTS_DIR = str(PROJECT_DIR / "output" / "charts")
+
+LEGACY_MACRO_DIR = os.path.join(BASE_DIR, "macro_barometer")
 
 os.makedirs(MACRO_DIR, exist_ok=True)
 os.makedirs(CHARTS_DIR, exist_ok=True)
@@ -105,10 +112,17 @@ SPRING_OFFSET = 0.0
 
 def parse_telemetry_config():
     """Reads telemetry_list.txt configuration and handles multi-line vertical columns."""
+    project_config_path = os.path.join(PROJECT_DIR, "data", "telemetry_list.txt")
     config_path = os.path.join(MACRO_DIR, "telemetry_list.txt")
+    legacy_config_path = os.path.join(LEGACY_MACRO_DIR, "telemetry_list.txt")
     index_symbols = []
     alpha_singles = []
     current_section = None
+
+    if os.path.exists(project_config_path):
+        config_path = project_config_path
+    elif not os.path.exists(config_path) and os.path.exists(legacy_config_path):
+        config_path = legacy_config_path
 
     if not os.path.exists(config_path):
         return index_symbols, alpha_singles
@@ -459,14 +473,15 @@ def generate_unified_two_pane_chart(symbol, anchors, consensus_positions, curren
             rows=2, cols=1, shared_xaxes=True, vertical_spacing=0.05,
             row_heights=[0.6, 0.4],
             specs=[[{"secondary_y": True}], [{"secondary_y": True}]],
-            subplot_titles=(f"PANEL 1: CORE RECONCILED PROFILE ({lbl_sym})", f"PANEL 2: HOOKE'S LAW RISK MATRIX FACTOR OVERLAYS FOR {lbl_sym}")
+            subplot_titles=("Panel 1: Asset price (raw/norm), VIX, UUP norm", "Panel 2: Delta norm Asset to norm VIX, UUP, SMA<n>")
         )
+        x_vals = timeline_x.tolist()
         
         # Panel 1 Traces
         if PRICE_CANDLESTICK == 1:
             fig.add_trace(
                 go.Candlestick(
-                    x=timeline_x.tolist(),
+                    x=x_vals,
                     open=normalize_price(df_slice['Open']).tolist(),
                     high=normalize_price(df_slice['High']).tolist(),
                     low=normalize_price(df_slice['Low']).tolist(),
@@ -487,8 +502,8 @@ def generate_unified_two_pane_chart(symbol, anchors, consensus_positions, curren
         else:
             fig.add_trace(
                 go.Scatter(
-                    x=timeline_x,
-                    y=df_slice['norm_A'],
+                    x=x_vals,
+                    y=df_slice['norm_A'].tolist(),
                     name=f"norm_{lbl_sym}",
                     line=dict(color='#00F0FF', width=2.5)
                 ),
@@ -496,9 +511,9 @@ def generate_unified_two_pane_chart(symbol, anchors, consensus_positions, curren
                 col=1,
                 secondary_y=False
             )
-        fig.add_trace(go.Scatter(x=timeline_x, y=df_slice['norm_VIX'], name='norm_VIX', line=dict(color='#FF3B30', width=1.5, dash='dot')), row=1, col=1, secondary_y=False)
-        fig.add_trace(go.Scatter(x=timeline_x, y=df_slice['norm_UUP'], name='norm_UUP', line=dict(color='#34C759', width=1.5, dash='dot')), row=1, col=1, secondary_y=False)
-        fig.add_trace(go.Scatter(x=timeline_x, y=df_slice['Close'], name=f"Raw {lbl_sym} Price", line=dict(color='#63E6BE', width=1.0)), row=1, col=1, secondary_y=True)
+        fig.add_trace(go.Scatter(x=x_vals, y=df_slice['norm_VIX'].tolist(), name='norm_VIX', line=dict(color='#FF3B30', width=1.5, dash='dot')), row=1, col=1, secondary_y=False)
+        fig.add_trace(go.Scatter(x=x_vals, y=df_slice['norm_UUP'].tolist(), name='norm_UUP', line=dict(color='#34C759', width=1.5, dash='dot')), row=1, col=1, secondary_y=False)
+        fig.add_trace(go.Scatter(x=x_vals, y=df_slice['Close'].tolist(), name=f"Raw {lbl_sym} Price", line=dict(color='#63E6BE', width=1.0)), row=1, col=1, secondary_y=True)
         
         # Plot Stacked Accumulation Entries
         # Accumulation / global minimum signals
@@ -543,15 +558,42 @@ def generate_unified_two_pane_chart(symbol, anchors, consensus_positions, curren
                     ),
                     row=1, col=1, secondary_y=False
                 )
+
+        panel_1_trace_count = len(fig.data)
+        panel_1_debug = []
+        for trace in fig.data[:panel_1_trace_count]:
+            x_values = np.asarray(trace.x if trace.x is not None else [], dtype=float)
+            if trace.type == "candlestick":
+                y_values = np.concatenate([
+                    np.asarray(getattr(trace, field), dtype=float)
+                    for field in ("open", "high", "low", "close")
+                ])
+            else:
+                y_values = np.asarray(trace.y if trace.y is not None else [], dtype=float)
+            finite_y_values = y_values[np.isfinite(y_values)]
+            panel_1_debug.append({
+                "name": trace.name,
+                "type": trace.type,
+                "xaxis": trace.xaxis or "x",
+                "yaxis": trace.yaxis or "y",
+                "x_length": int(x_values.size),
+                "x_finite": int(np.isfinite(x_values).sum()),
+                "y_length": int(y_values.size),
+                "y_finite": int(np.isfinite(y_values).sum()),
+                "x_first": float(x_values[0]) if x_values.size else None,
+                "x_last": float(x_values[-1]) if x_values.size else None,
+                "y_min": float(finite_y_values.min()) if finite_y_values.size else None,
+                "y_max": float(finite_y_values.max()) if finite_y_values.size else None,
+            })
         
         # Panel 2 Traces
-        fig.add_trace(go.Scatter(x=timeline_x, y=df_slice['vs_vx'], name=f'vs VIX Delta', line=dict(color='#FF9500', width=2.2)), row=2, col=1, secondary_y=False)
-        fig.add_trace(go.Scatter(x=timeline_x, y=df_slice['vs_uup'], name=f'vs UUP Delta', line=dict(color='#AF52DE', width=2.2)), row=2, col=1, secondary_y=False)
-        fig.add_trace(go.Scatter(x=timeline_x, y=df_slice['spring'], name=f'vs SMA Delta (spring ext.)', line=dict(color='#00FF66', width=2.5)), row=2, col=1, secondary_y=False)
+        fig.add_trace(go.Scatter(x=x_vals, y=df_slice['vs_vx'].tolist(), name=f'vs VIX Delta', line=dict(color='#FF9500', width=2.2)), row=2, col=1, secondary_y=False)
+        fig.add_trace(go.Scatter(x=x_vals, y=df_slice['vs_uup'].tolist(), name=f'vs UUP Delta', line=dict(color='#AF52DE', width=2.2)), row=2, col=1, secondary_y=False)
+        fig.add_trace(go.Scatter(x=x_vals, y=df_slice['spring'].tolist(), name=f'vs SMA Delta (spring ext.)', line=dict(color='#00FF66', width=2.5)), row=2, col=1, secondary_y=False)
         fig.add_trace(
             go.Scatter(
-                x=timeline_x,
-                y=df_slice['norm_OBV_wave'],
+                x=x_vals,
+                y=df_slice['norm_OBV_wave'].tolist(),
                 name="norm OBV5",
                 line=dict(
                     color="#4D96FF",
@@ -566,8 +608,8 @@ def generate_unified_two_pane_chart(symbol, anchors, consensus_positions, curren
         if MF_STOCH == 1:
             fig.add_trace(
                 go.Scatter(
-                    x=timeline_x,
-                    y=df_slice['market_forecast'],
+                    x=x_vals,
+                    y=df_slice['market_forecast'].tolist(),
                     name="TOS Market Forecast (Int)",
                     line=dict(color='#B5179E', width=1.0, dash='dot')
                 ),
@@ -577,8 +619,8 @@ def generate_unified_two_pane_chart(symbol, anchors, consensus_positions, curren
             )
             fig.add_trace(
                 go.Scatter(
-                    x=timeline_x,
-                    y=df_slice['stoch_delta_wave'],
+                    x=x_vals,
+                    y=df_slice['stoch_delta_wave'].tolist(),
                     name="Stochastic Slow Delta %K-%D",
                     line=dict(color='#4CC9F0', width=1.0, dash='dot')
                 ),
@@ -622,19 +664,226 @@ def generate_unified_two_pane_chart(symbol, anchors, consensus_positions, curren
                     "%{fullData.name}: %{y}<extra></extra>"
                 )
 
+        future_opex_x = [
+            x_pos for x_pos in hist_opex_x if x_pos > timeline_x[-1]
+        ]
+        next_opex_x = future_opex_x[0] if future_opex_x else timeline_x[-1]
+        reset_opex_x = future_opex_x[1] if len(future_opex_x) > 1 else next_opex_x
+        full_x_range = [max(-PLOT_RANGE, timeline_x[0]), float(next_opex_x)]
+        reset_x_range = [max(-PLOT_RANGE, timeline_x[0]), float(reset_opex_x)]
+        recent_x_range = [
+            max(-100, float(timeline_x[0])),
+            float(next_opex_x)
+        ]
+        slider_steps = [{
+            "label": "Full Range",
+            "method": "relayout",
+            "args": [{
+                "xaxis.range": full_x_range,
+                "xaxis2.range": full_x_range
+            }]
+        }]
+        slider_window = min(100, len(timeline_x))
+        next_opex_start_idx = max(0, len(timeline_x) - slider_window)
+        slider_steps.append({
+            "label": "Next OptExp",
+            "method": "relayout",
+            "args": [{
+                "xaxis.range": [
+                    float(timeline_x[next_opex_start_idx]),
+                    float(next_opex_x)
+                ],
+                "xaxis2.range": [
+                    float(timeline_x[next_opex_start_idx]),
+                    float(next_opex_x)
+                ]
+            }]
+        })
+        for window_end_idx in range(len(timeline_x) - 1, slider_window - 2, -1):
+            window_start_idx = window_end_idx - slider_window + 1
+            window_range = [
+                float(timeline_x[window_start_idx]),
+                float(timeline_x[window_end_idx])
+            ]
+            slider_steps.append({
+                "label": str(int(timeline_x[window_end_idx])),
+                "method": "relayout",
+                "args": [{
+                    "xaxis.range": window_range,
+                    "xaxis2.range": window_range
+                }]
+            })
+
+        default_annotations = [
+            annotation.to_plotly_json()
+            for annotation in fig.layout.annotations
+        ]
+        panel_1_annotations = [{
+            "text": "Panel 1: Asset price (raw/norm), VIX, UUP norm",
+            "xref": "paper",
+            "yref": "paper",
+            "x": 0.5,
+            "y": 0.985,
+            "showarrow": False,
+            "font": {"size": 14, "color": "#FFFFFF"}
+        }]
+        panel_2_annotations = [{
+            "text": "Panel 2: Delta norm Asset to norm VIX, UUP, SMA<n>",
+            "xref": "paper",
+            "yref": "paper",
+            "x": 0.5,
+            "y": 0.985,
+            "showarrow": False,
+            "font": {"size": 14, "color": "#FFFFFF"}
+        }]
+
+        def _axis_values(trace_obj):
+            if trace_obj.type == "candlestick":
+                lows = np.asarray(trace_obj.low, dtype=float)
+                highs = np.asarray(trace_obj.high, dtype=float)
+                return np.concatenate([lows, highs])
+            y_vals = getattr(trace_obj, "y", None)
+            if y_vals is None:
+                return np.array([], dtype=float)
+            return np.asarray(y_vals, dtype=float)
+
+        def _padded_range(values, pad_ratio=0.08):
+            finite_vals = values[np.isfinite(values)]
+            if finite_vals.size == 0:
+                return [0.0, 1.0]
+            v_min = float(np.min(finite_vals))
+            v_max = float(np.max(finite_vals))
+            span = max(v_max - v_min, 1e-6)
+            pad = span * pad_ratio
+            return [v_min - pad, v_max + pad]
+
+        panel_1_primary_vals = []
+        panel_1_secondary_vals = []
+        for t in fig.data[:panel_1_trace_count]:
+            t_axis = t.yaxis or "y"
+            t_vals = _axis_values(t)
+            if t_vals.size == 0:
+                continue
+            if t_axis == "y":
+                panel_1_primary_vals.append(t_vals)
+            elif t_axis == "y2":
+                panel_1_secondary_vals.append(t_vals)
+
+        panel_1_primary_range = _padded_range(
+            np.concatenate(panel_1_primary_vals) if panel_1_primary_vals else np.array([], dtype=float)
+        )
+        panel_1_secondary_range = _padded_range(
+            np.concatenate(panel_1_secondary_vals) if panel_1_secondary_vals else np.array([], dtype=float)
+        )
+
+        panel_2_primary_vals = []
+        panel_2_secondary_vals = []
+        for t in fig.data[panel_1_trace_count:]:
+            t_axis = t.yaxis or "y"
+            t_vals = _axis_values(t)
+            if t_vals.size == 0:
+                continue
+            if t_axis == "y3":
+                panel_2_primary_vals.append(t_vals)
+            elif t_axis == "y4":
+                panel_2_secondary_vals.append(t_vals)
+
+        panel_2_primary_range = _padded_range(
+            np.concatenate(panel_2_primary_vals) if panel_2_primary_vals else np.array([], dtype=float)
+        )
+        panel_2_secondary_range = _padded_range(
+            np.concatenate(panel_2_secondary_vals) if panel_2_secondary_vals else np.array([], dtype=float)
+        )
+
+        total_trace_count = len(fig.data)
+        dual_visibility = [True] * total_trace_count
+        panel_1_visibility = [
+            idx < panel_1_trace_count for idx in range(total_trace_count)
+        ]
+        panel_2_visibility = [
+            idx >= panel_1_trace_count for idx in range(total_trace_count)
+        ]
+        panel_1_trace_indices = list(range(panel_1_trace_count))
+        panel_2_trace_indices = list(range(panel_1_trace_count, total_trace_count))
+
+        dual_domains = {
+            "yaxis.domain": [0.42, 1.0],
+            "yaxis2.domain": [0.42, 1.0],
+            "yaxis3.domain": [0.0, 0.38],
+            "yaxis4.domain": [0.0, 0.38],
+            "yaxis.visible": True,
+            "yaxis2.visible": True,
+            "yaxis3.visible": True,
+            "yaxis4.visible": True,
+            "yaxis.autorange": True,
+            "yaxis2.autorange": True,
+            "yaxis3.autorange": True,
+            "yaxis4.autorange": True,
+            "xaxis.visible": True,
+            "xaxis2.visible": True,
+            "xaxis.matches": "x2",
+            "xaxis2.matches": None,
+            "xaxis.showticklabels": False,
+            "xaxis.anchor": "y",
+            "xaxis2.anchor": "y3",
+            "annotations": default_annotations
+        }
+        panel_1_domains = {
+            "yaxis.domain": [0.0, 1.0],
+            "yaxis2.domain": [0.0, 1.0],
+            "yaxis3.domain": [0.0, 0.0],
+            "yaxis4.domain": [0.0, 0.0],
+            "yaxis.visible": True,
+            "yaxis2.visible": True,
+            "yaxis3.visible": False,
+            "yaxis4.visible": False,
+            "yaxis.autorange": False,
+            "yaxis2.autorange": False,
+            "yaxis.range": panel_1_primary_range,
+            "yaxis2.range": panel_1_secondary_range,
+            "xaxis.visible": True,
+            "xaxis2.visible": False,
+            "xaxis.autorange": True,
+            "xaxis.matches": None,
+            "xaxis.showticklabels": True,
+            "xaxis.anchor": "y",
+            "annotations": panel_1_annotations
+        }
+        panel_2_domains = {
+            "yaxis.domain": [0.0, 0.0],
+            "yaxis2.domain": [0.0, 0.0],
+            "yaxis3.domain": [0.0, 1.0],
+            "yaxis4.domain": [0.0, 1.0],
+            "yaxis.visible": False,
+            "yaxis2.visible": False,
+            "yaxis3.visible": True,
+            "yaxis4.visible": True,
+            "yaxis3.autorange": False,
+            "yaxis4.autorange": False,
+            "yaxis3.range": panel_2_primary_range,
+            "yaxis4.range": panel_2_secondary_range,
+            "xaxis.visible": False,
+            "xaxis2.visible": True,
+            "xaxis.matches": None,
+            "xaxis2.matches": None,
+            "xaxis.anchor": "y3",
+            "xaxis2.anchor": "y3",
+            "annotations": panel_2_annotations
+        }
+
         # Restore the dark, wide, two-panel dashboard layout.
         fig.update_layout(
             template="plotly_dark",
             paper_bgcolor="#1C1C1E",
             plot_bgcolor="#1C1C1E",
             height=1200,
-            width=1400,
-            margin=dict(l=100, r=80, t=110, b=50),
+            width=1600,
+            margin=dict(l=100, r=80, t=60, b=50),
             title=dict(
                 text=f"📡 QUANT MATRIX TERMINAL: {lbl_sym} ADVANCED PROFILE",
                 font=dict(size=16, color="#FFFFFF"),
                 x=0.5,
-                y=0.995,
+                y=0.992,
                 xanchor="center",
                 yanchor="top"
             ),
@@ -642,21 +891,104 @@ def generate_unified_two_pane_chart(symbol, anchors, consensus_positions, curren
             legend=dict(
                 orientation="h",
                 yanchor="top",
-                y=1.08,
+                y=1.05,
                 xanchor="center",
                 x=0.5,
                 font=dict(size=10, color="#D1D1D6")
             ),
+            yaxis_domain=[0.42, 1.0],
+            yaxis2_domain=[0.42, 1.0],
+            yaxis3_domain=[0.0, 0.38],
+            yaxis4_domain=[0.0, 0.38],
             yaxis=dict(title_text="Norm Asset/VIX/UUP"),
             yaxis2=dict(title_text="Raw Asset price ($)"),
             yaxis3=dict(title_text="Delta Norm Asset to Norm VIX/UUP"),
             yaxis4=dict(title_text="Norm OBV (range)"),
             xaxis=dict(
                 type="linear",
-                range=[max(-PLOT_RANGE, timeline_x[0]), timeline_x[-1]],
+                range=reset_x_range,
                 rangeslider=dict(visible=False)
             ),
-            xaxis2=dict(type="linear"),
+            xaxis2=dict(
+                type="linear",
+                range=reset_x_range
+            ),
+            sliders=[
+                dict(
+                    active=0,
+                    currentvalue={"prefix": "Bar window end: "},
+                    pad={"t": 28},
+                    ticklen=3,
+                    tickwidth=1,
+                    font={"size": 8},
+                    x=0.08,
+                    xanchor="left",
+                    len=0.84,
+                    steps=slider_steps
+                )
+            ],
+            updatemenus=[
+                dict(
+                    type="buttons",
+                    visible=False,
+                    direction="right",
+                    x=0.005,
+                    xanchor="left",
+                    y=1.14,
+                    yanchor="top",
+                    pad={"r": 1, "t": 1, "b": 1, "l": 1},
+                    font={"size": 9},
+                    buttons=[
+                        dict(label="Dual Panel", method="skip"),
+                        dict(label="Panel 1", method="skip"),
+                        dict(label="Panel 2", method="skip")
+                    ]
+                ),
+                dict(
+                    type="buttons",
+                    direction="right",
+                    x=0.005,
+                    xanchor="left",
+                    y=1.06,
+                    yanchor="top",
+                    pad={"r": 1, "t": 1, "b": 1, "l": 1},
+                    font={"size": 9},
+                    buttons=[
+                        dict(
+                            label="Zoom In",
+                            method="relayout",
+                            args=[{
+                                "xaxis.range": [
+                                    recent_x_range[0], recent_x_range[1]
+                                ],
+                                "xaxis2.range": [
+                                    recent_x_range[0], recent_x_range[1]
+                                ]
+                            }]
+                        ),
+                        dict(
+                            label="Zoom Out",
+                            method="relayout",
+                            args=[{
+                                "xaxis.range": [
+                                    full_x_range[0], full_x_range[1]
+                                ],
+                                "xaxis2.range": [
+                                    full_x_range[0], full_x_range[1]
+                                ]
+                            }]
+                        ),
+                        dict(
+                            label="Reset X",
+                            method="relayout",
+                            args=[{
+                                "xaxis.range": reset_x_range,
+                                "xaxis2.range": reset_x_range
+                            }]
+                        )
+                    ]
+                )
+            ],
             hovermode="x unified",
             font=dict(color="#FFFFFF")
         )
@@ -688,8 +1020,95 @@ def generate_unified_two_pane_chart(symbol, anchors, consensus_positions, curren
         shape_1 = len(fig.layout.shapes) - 2
         shape_2 = len(fig.layout.shapes) - 1
 
+        def _to_json_native(obj):
+            if isinstance(obj, np.generic):
+                return obj.item()
+            if isinstance(obj, dict):
+                return {k: _to_json_native(v) for k, v in obj.items()}
+            if isinstance(obj, (list, tuple)):
+                return [_to_json_native(v) for v in obj]
+            return obj
+
+        dual_domains_js = json.dumps(_to_json_native(dual_domains))
+        panel_1_domains_js = json.dumps(_to_json_native(panel_1_domains))
+        panel_2_domains_js = json.dumps(_to_json_native(panel_2_domains))
+        dual_visibility_js = json.dumps(_to_json_native(dual_visibility))
+        panel_1_visibility_js = json.dumps(_to_json_native(panel_1_visibility))
+        panel_2_visibility_js = json.dumps(_to_json_native(panel_2_visibility))
+        panel_1_trace_indices_js = json.dumps(_to_json_native(panel_1_trace_indices))
+        panel_2_trace_indices_js = json.dumps(_to_json_native(panel_2_trace_indices))
+
         post_script = f"""
         const gd = document.getElementById('{{plot_id}}');
+        const dualLayout = {dual_domains_js};
+        const panel1Layout = {panel_1_domains_js};
+        const panel2Layout = {panel_2_domains_js};
+        const dualVisible = {dual_visibility_js};
+        const panel1Visible = {panel_1_visibility_js};
+        const panel2Visible = {panel_2_visibility_js};
+        const panel1Indices = {panel_1_trace_indices_js};
+        const panel2Indices = {panel_2_trace_indices_js};
+
+        function buildModeStatus() {{
+            const parent = gd.parentElement || document.body;
+            let badge = parent.querySelector('.qt-mode-status');
+            if (!badge) {{
+                badge = document.createElement('div');
+                badge.className = 'qt-mode-status';
+                badge.style.position = 'absolute';
+                badge.style.right = '12px';
+                badge.style.top = '10px';
+                badge.style.zIndex = '50';
+                badge.style.padding = '4px 8px';
+                badge.style.fontSize = '11px';
+                badge.style.fontFamily = 'monospace';
+                badge.style.background = 'rgba(28,28,30,0.8)';
+                badge.style.color = '#D1D1D6';
+                badge.style.border = '1px solid rgba(255,255,255,0.2)';
+                badge.style.borderRadius = '4px';
+                badge.style.pointerEvents = 'none';
+                parent.style.position = 'relative';
+                parent.appendChild(badge);
+            }}
+            return badge;
+        }}
+
+        function updateModeStatus(label) {{
+            if (!gd || !gd.data) return;
+            const badge = buildModeStatus();
+            const traces = gd.data.map((t, i) => {{
+                const visible = (t.visible === undefined) ? true : t.visible;
+                return {{ i, yaxis: t.yaxis || 'y', visible }};
+            }});
+            const top = traces.filter(t => t.visible !== false && (t.yaxis === 'y' || t.yaxis === 'y2')).length;
+            const bottom = traces.filter(t => t.visible !== false && (t.yaxis === 'y3' || t.yaxis === 'y4')).length;
+            badge.textContent = `mode=${{label}} top=${{top}} bottom=${{bottom}}`;
+        }}
+
+        function applyMode(mode) {{
+            let layoutUpdate = dualLayout;
+            let visibleIndices = panel1Indices.concat(panel2Indices);
+            let hiddenIndices = [];
+
+            if (mode === 'panel1') {{
+                visibleIndices = panel1Indices;
+                hiddenIndices = panel2Indices;
+                layoutUpdate = panel1Layout;
+            }} else if (mode === 'panel2') {{
+                visibleIndices = panel2Indices;
+                hiddenIndices = panel1Indices;
+                layoutUpdate = panel2Layout;
+            }}
+
+            const showActive = Plotly.restyle(gd, {{ visible: true }}, visibleIndices);
+            const hideInactive = hiddenIndices.length
+                ? showActive.then(() => Plotly.restyle(gd, {{ visible: false }}, hiddenIndices))
+                : showActive;
+            return hideInactive
+                .then(() => Plotly.relayout(gd, layoutUpdate))
+                .then(() => Plotly.Plots.resize(gd))
+                .then(() => Plotly.redraw(gd));
+        }}
 
         gd.on('plotly_hover', function(eventData) {{
             if (!eventData.points || !eventData.points.length) return;
@@ -723,6 +1142,21 @@ def generate_unified_two_pane_chart(symbol, anchors, consensus_positions, curren
                 'shapes[{shape_2}].opacity': 0
             }});
         }});
+
+        gd.on('plotly_buttonclicked', function(eventData) {{
+            const label = eventData && eventData.button ? eventData.button.label : '';
+            if (label === 'Dual Panel') {{
+                applyMode('dual');
+            }} else if (label === 'Panel 1') {{
+                applyMode('panel1');
+            }} else if (label === 'Panel 2') {{
+                applyMode('panel2');
+            }}
+            setTimeout(() => updateModeStatus(label || 'click'), 120);
+        }});
+
+        setTimeout(() => updateModeStatus('initial'), 120);
+
         """
 
         dt_file_lbl = (
@@ -730,14 +1164,168 @@ def generate_unified_two_pane_chart(symbol, anchors, consensus_positions, curren
             if hasattr(current_run_date, "strftime")
             else str(current_run_date).split(" ")[0]
         )
-        out_name = f"{dt_file_lbl}_{lbl_sym}_BAROMETER.html"
+        ts_suffix = datetime.now().strftime("%H%M%S")
+        out_name = f"{dt_file_lbl}_{lbl_sym}_BAROMETER_{ts_suffix}.html"
 
-        fig.write_html(
-            os.path.join(CHARTS_DIR, out_name),
-            include_plotlyjs="inline",
-            post_script=post_script
+        output_chart_path = os.path.join(CHARTS_DIR, out_name)
+
+        def build_focus_figure(
+            trace_start,
+            trace_end,
+            title,
+            axis_map,
+            primary_range,
+            secondary_range,
+            secondary_trace_names=None
+        ):
+            secondary_trace_names = set(secondary_trace_names or ())
+            focus_traces = []
+            for source_trace in fig.data[trace_start:trace_end]:
+                trace_json = source_trace.to_plotly_json()
+                trace_json["xaxis"] = "x"
+                trace_json["yaxis"] = (
+                    "y2"
+                    if trace_json.get("name") in secondary_trace_names
+                    else axis_map.get(trace_json.get("yaxis", "y"), "y")
+                )
+                focus_traces.append(trace_json)
+
+            focus_fig = go.Figure(data=focus_traces)
+            focus_fig.update_layout(
+                template="plotly_dark",
+                paper_bgcolor="#1C1C1E",
+                plot_bgcolor="#1C1C1E",
+                height=1200,
+                width=1600,
+                margin=dict(l=100, r=80, t=105, b=50),
+                title=dict(
+                    text=title,
+                    font=dict(size=16, color="#FFFFFF"),
+                    x=0.5,
+                    y=0.99,
+                    xanchor="center",
+                    yanchor="top"
+                ),
+                showlegend=True,
+                legend=dict(
+                    orientation="h",
+                    yanchor="top",
+                    y=1.05,
+                    xanchor="center",
+                    x=0.5
+                ),
+                hovermode="x unified",
+                xaxis=dict(
+                    type="linear",
+                    range=reset_x_range,
+                    title_text="Bars",
+                    rangeslider=dict(visible=False)
+                ),
+                yaxis=dict(
+                    title_text=(
+                        "Norm Asset/VIX/UUP"
+                        if "Panel 1" in title
+                        else "Delta Norm Asset to Norm VIX/UUP"
+                    ),
+                    range=primary_range,
+                    autorange=False,
+                    side="left",
+                    anchor="x"
+                ),
+                yaxis2=dict(
+                    title_text=(
+                        "Raw Asset price ($)"
+                        if "Panel 1" in title
+                        else "Norm OBV (range)"
+                    ),
+                    range=secondary_range,
+                    autorange=False,
+                    overlaying="y",
+                    side="right",
+                    anchor="x",
+                    showgrid=False
+                ),
+                font=dict(color="#FFFFFF")
+            )
+            for h_x in hist_opex_x:
+                focus_fig.add_vline(
+                    x=h_x,
+                    line=dict(color="#9B5DE5", width=1.2, dash="dot")
+                )
+            return focus_fig
+
+        panel_1_fig = build_focus_figure(
+            0,
+            panel_1_trace_count,
+            f"QUANT MATRIX TERMINAL: {lbl_sym} - Panel 1",
+            {"y": "y", "y2": "y2"},
+            panel_1_primary_range,
+            panel_1_secondary_range,
+            {f"Raw {lbl_sym} Price"}
         )
+        panel_2_fig = build_focus_figure(
+            panel_1_trace_count,
+            len(fig.data),
+            f"QUANT MATRIX TERMINAL: {lbl_sym} - Panel 2",
+            {"y3": "y", "y4": "y2"},
+            panel_2_primary_range,
+            panel_2_secondary_range
+        )
+
+        debug_path = f"{output_chart_path}.panel1-debug.json"
+        with open(debug_path, "w", encoding="utf-8") as debug_file:
+            json.dump({
+                "symbol": lbl_sym,
+                "rows": int(len(df_slice)),
+                "timeline_length": int(len(timeline_x)),
+                "panel_1_trace_count": int(panel_1_trace_count),
+                "traces": panel_1_debug,
+            }, debug_file, indent=2)
+
+            dual_html = pio.to_html(
+                fig,
+                full_html=False,
+                include_plotlyjs="inline",
+                post_script=post_script
+            )
+            panel_1_html = pio.to_html(panel_1_fig, full_html=False, include_plotlyjs=False)
+            panel_2_html = pio.to_html(panel_2_fig, full_html=False, include_plotlyjs=False)
+            tabbed_html = f"""<!doctype html>
+<html>
+<head><meta charset="utf-8"><title>QUANT MATRIX TERMINAL: {lbl_sym}</title>
+<style>
+body {{ margin: 0; background: #1C1C1E; color: #FFFFFF; font-family: monospace; }}
+.qt-tabs {{ display: flex; gap: 4px; padding: 8px; background: #111113; position: sticky; top: 0; z-index: 20; }}
+.qt-tab {{ border: 1px solid #555; background: #303038; color: #FFF; padding: 8px 14px; cursor: pointer; }}
+.qt-tab.active {{ background: #4D6A8A; }}
+.qt-view {{ display: none; }}
+.qt-view.active {{ display: block; }}
+</style></head>
+<body>
+<nav class="qt-tabs" aria-label="Chart views">
+    <button class="qt-tab active" data-view="dual">Dual Panel</button>
+    <button class="qt-tab" data-view="panel1">Panel 1</button>
+    <button class="qt-tab" data-view="panel2">Panel 2</button>
+</nav>
+<main>
+    <section id="dual" class="qt-view active">{dual_html}</section>
+    <section id="panel1" class="qt-view">{panel_1_html}</section>
+    <section id="panel2" class="qt-view">{panel_2_html}</section>
+</main>
+<script>
+document.querySelectorAll('.qt-tab').forEach((tab) => tab.addEventListener('click', () => {{
+    document.querySelectorAll('.qt-tab').forEach((item) => item.classList.toggle('active', item === tab));
+    document.querySelectorAll('.qt-view').forEach((view) => view.classList.toggle('active', view.id === tab.dataset.view));
+    const plot = document.querySelector(`#${{tab.dataset.view}} .js-plotly-plot`);
+    if (plot && window.Plotly) window.Plotly.Plots.resize(plot);
+}}));
+</script>
+</body></html>"""
+        with open(output_chart_path, "w", encoding="utf-8") as chart_file:
+            chart_file.write(tabbed_html)
         print(f"   ✨ Unified Portrait Canvas Compiled Successfully -> {out_name}")
+        print(f"      📂 Chart path: {output_chart_path}")
+        print(f"      🔎 Panel 1 diagnostics: {debug_path}")
         consensus_positions.append(float(df_slice['spring'].iloc[-1]))
     except Exception as e:
         print(f"   ⚠️ Visual Engine Exception for {lbl_sym}: {e}")
