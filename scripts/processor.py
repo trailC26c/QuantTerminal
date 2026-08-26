@@ -19,6 +19,7 @@ from pathlib import Path
 import pandas as pd
 import numpy as np
 import yfinance as yf
+from local_data_store import LocalDataStore
 
 # =========================================================================
 # 🎛️ COMMAND LINE INTERFACE (CLI) ARGUMENT EXTENSION PARSER
@@ -28,21 +29,29 @@ parser.add_argument(
     "--input", 
     type=str, 
     default="native", 
-    choices=["native", "generic"], 
-    help="Set pipeline ingestion target source mode type: native (TOS exports) or generic (Flat tracking list)"
+    choices=["native", "generic", "all"],
+    help="Input mode: native keyed files, generic telemetry, or both"
 )
+parser.add_argument("--privacy_guard", type=int, choices=(0, 1), default=1, help="Strip personal and portfolio data: 1=on, 0=off")
+parser.add_argument("--offline", action="store_true", help="Use only local data; do not access Yahoo Finance")
 args, unknown = parser.parse_known_args()
 INPUT_MODE = args.input.lower().strip()
+PRIVACY_GUARD = args.privacy_guard == 1
+OFFLINE = args.offline
 
 # Standard Workspace Path Layout
 BASE_DIR = Path(r"C:\Users\tcnet\TOS_Data_Local")
+PROJECT_DIR = Path(__file__).resolve().parents[1]
 INPUT_DIR = BASE_DIR / "raw_watchlists"
 MACRO_DIR = BASE_DIR / "macro_barometer"
-SANITIZED_DIR = BASE_DIR / "sanitized_watchlists"
+SANITIZED_DIR = PROJECT_DIR / "data" / "sanitized_watchlists"
+PROCESSED_DIR = PROJECT_DIR / "data" / "processed_watchlists"
+DATABASE_PATH = PROJECT_DIR / "data" / "quant_terminal.db"
 
 # Ensure workspace runtime folders are present
 INPUT_DIR.mkdir(parents=True, exist_ok=True)
 SANITIZED_DIR.mkdir(parents=True, exist_ok=True)
+PROCESSED_DIR.mkdir(parents=True, exist_ok=True)
 
 def get_latest_date_from_files() -> str:
     """Scans raw folder for files containing YYYY-MM-DD pattern and returns the newest date."""
@@ -66,11 +75,35 @@ def get_latest_date_from_files() -> str:
     return latest_date
 
 
+WATCHLIST_PATTERN = re.compile(
+    r"^(?P<date>\d{4}-\d{2}-\d{2})[-_]watchlist[-_](?P<key>[A-Za-z0-9][A-Za-z0-9_-]*?)(?:_SANITIZED(?:-options)?)?\.csv$",
+    re.IGNORECASE,
+)
+
+
+def watchlist_metadata(file_path: Path) -> tuple[str, str] | None:
+    match = WATCHLIST_PATTERN.fullmatch(file_path.name)
+    if not match:
+        return None
+    return match.group("date"), match.group("key").lower().replace("allposition", "allpos")
+
+
+def get_keyed_watchlist_files(target_date: str) -> list[Path]:
+    return sorted(
+        path for path in INPUT_DIR.iterdir()
+        if path.is_file()
+        and (metadata := watchlist_metadata(path))
+        and metadata[0] == target_date
+    )
+
+
 def parse_generic_telemetry_symbols() -> list:
     """🎯 SYNCHRONIZED MATRIX PARSER CORE: Crawls telemetry_list.txt configuration,
     extracting index tokens and multi-line vertical single-column symbols ([ALPHA_SINGLES]) 
     into a single unified flat row array for yfinance synthetic table processing."""
-    config_path = MACRO_DIR / "telemetry_list.txt"
+    config_path = PROJECT_DIR / "data" / "telemetry_list.txt"
+    if not config_path.exists():
+        config_path = MACRO_DIR / "telemetry_list.txt"
     flat_symbols_pool = []
     current_section = None
     
@@ -92,6 +125,9 @@ def parse_generic_telemetry_symbols() -> list:
             elif line_str == "[ALPHA_SINGLES]":
                 current_section = "ALPHA"
                 continue
+            elif line_str == "[POSITIONS]":
+                current_section = "POSITIONS"
+                continue
                 
             # Tokenize on commas to seamlessly blend flat string lines and newlines together
             tokens = [t.strip().upper() for t in line_str.split(',') if t.strip()]
@@ -101,6 +137,31 @@ def parse_generic_telemetry_symbols() -> list:
                     flat_symbols_pool.append(token_clean)
                     
     return flat_symbols_pool
+
+
+def get_local_cached_data(symbols: list[str]) -> dict[str, dict]:
+    """Return latest locally stored values for offline generic generation."""
+    if not DATABASE_PATH.exists():
+        return {}
+    store = LocalDataStore(DATABASE_PATH)
+    cached = {}
+    try:
+        for symbol in symbols:
+            lookup_key = translate_tos_symbol(symbol)
+            rows = store.market_bars(lookup_key) or store.market_bars(symbol)
+            if rows:
+                latest = rows[-1]
+                snapshot = store.get_fundamental_snapshot(symbol, 36500) or {}
+                cached[symbol] = {
+                    "Last": latest[4] or "",
+                    "Volume": latest[6] or 0,
+                    "PE": snapshot.get("PE_Ratio", ""),
+                    "Yield": snapshot.get("Yield", ""),
+                }
+                cached[lookup_key] = cached[symbol]
+    finally:
+        store.close()
+    return cached
 
 """
 QUANT TERMINAL - Step 1: Integrated Watchlist Ingestion & Option Stripper Engine
@@ -232,7 +293,9 @@ def generate_synthetic_generic_watchlist(target_date_str: str):
         print("   ⚠️ Generation Halt: No valid symbols extracted from config parameters.")
         return
         
-    market_db = fetch_yfinance_underlying_data(symbols, target_date_str)
+    market_db = get_local_cached_data(symbols) if OFFLINE else fetch_yfinance_underlying_data(symbols, target_date_str)
+    if OFFLINE:
+        print(f"🔌 Offline mode: using local cached data for {len(set(symbols) & set(market_db))}/{len(symbols)} telemetry symbols.")
     synthetic_rows = []
     
     for orig_sym in symbols:
@@ -240,7 +303,7 @@ def generate_synthetic_generic_watchlist(target_date_str: str):
         m_data = market_db.get(lookup_key, {"Last": "", "Volume": "", "PE": "", "Yield": ""})
         
         row_template = {
-            "Symbol": orig_sym.upper(), "Last": m_data["Last"], "Delta": 1, "Mark % of Pos": "()", "%Change": "()",
+            "Symbol": orig_sym.upper(), "Source_Watchlists": "generic", "Last": m_data["Last"], "Delta": 1, "Mark % of Pos": "()", "%Change": "()",
             "Volume": m_data["Volume"], "Open.Int": 0, "Size": "0 x 0", "PE": m_data["PE"], "Yield": m_data["Yield"],
             "P/C Ratio": 0.0, "Bid": m_data["Last"], "Ask": m_data["Last"], "P/L Open": "()", "P/L %": "()",
             "P/L Day": "()", "Net Liq": "()", "Days": ""
@@ -255,7 +318,12 @@ def generate_synthetic_generic_watchlist(target_date_str: str):
             synthetic_df["Volume"] = synthetic_df["Volume"].apply(lambda x: f"{int(x):,}" if pd.notna(x) and str(x).replace('.0','').isdigit() and int(x) > 0 else "0")
             
         out_name = f"{target_date_str}-watchlist-generic_SANITIZED.csv"
-        synthetic_df.to_csv(SANITIZED_DIR / out_name, index=False)
+        try:
+            synthetic_df.to_csv(SANITIZED_DIR / out_name, index=False, encoding="utf-8-sig")
+        except PermissionError:
+            print(f"⚠️ Generic output is locked by another application: {SANITIZED_DIR / out_name}")
+            print("   Close the existing CSV in Excel or another viewer, then rerun the processor.")
+            return
         print("\n" + "=" * 75)
         print(f"🏆 SUCCESS: Synthetic Generic Watchlist Compiled Natively -> {out_name}")
         print(f"📊 Active Tracking Universe: {len(synthetic_df)} Asset Rows Structurally Formatted")
@@ -274,9 +342,14 @@ def process_and_export_matrix(file_path: Path, target_date_str: str):
     rename_map = {"Bid.Size": "Bid Size", "Ask.Size": "Ask Size", "P/C.Ratio": "P/C Ratio", "PC Ratio": "P/C Ratio", "Open.Int": "Open.Int", "Open Interest": "Open.Int", "Pos Qty": "Pos Qty", "Qty": "Pos Qty", "pos qty": "Pos Qty"}
     df.rename(columns={k: v for k, v in rename_map.items() if k in df.columns}, inplace=True)
 
-    core_columns = ["Symbol", "Last", "Delta", "Mark % of Pos", "Qty", "%Change", "Volume", "Open.Int", "Size", "PE", "Yield", "P/C Ratio", "Bid", "Ask", "P/L Open", "P/L %", "P/L Day", "Net Liq", "Days"]
+    metadata = watchlist_metadata(file_path)
+    if metadata is None:
+        raise ValueError(f"Unsupported keyed watchlist filename: {file_path.name}")
+    _, watchlist_key = metadata
+    core_columns = ["Symbol", "Source_Watchlists", "Last", "Delta", "Mark % of Pos", "Qty", "%Change", "Volume", "Open.Int", "Size", "PE", "Yield", "P/C Ratio", "Bid", "Ask", "P/L Open", "P/L %", "P/L Day", "Net Liq", "Days"]
     for col in core_columns:
         if col not in df.columns: df[col] = ""
+    df["Source_Watchlists"] = watchlist_key
 
     sensitive_columns = ["Pos Qty", "Qty", "Pos Qty Qty", "%Change", "P/L Open", "P/L %", "P/L Day", "Net Liq", "Mark % of Pos"]
     df_options_only = df[df["Symbol"].astype(str).str.strip().str.startswith(".")].copy()
@@ -300,8 +373,12 @@ def process_and_export_matrix(file_path: Path, target_date_str: str):
         if s not in existing_symbols: stocks_needing_patch.append(s)
             
     stocks_needing_patch = list(set(stocks_needing_patch))
-    if stocks_needing_patch:
+    if stocks_needing_patch and not OFFLINE:
         synthetic_data_map = fetch_yfinance_underlying_data(stocks_needing_patch, target_date_str)
+    else:
+        synthetic_data_map = {}
+        if stocks_needing_patch and OFFLINE:
+            print(f"🔌 Offline mode: leaving {len(stocks_needing_patch)} missing enrichment values unchanged.")
         for idx, row in df_stocks_only.iterrows():
             sym = str(row["Symbol"]).strip()
             lookup_key = translate_tos_symbol(sym)
@@ -331,6 +408,8 @@ def process_and_export_matrix(file_path: Path, target_date_str: str):
         df_stocks_only["Volume"] = df_stocks_only["Volume"].apply(lambda x: f"{int(x):,}" if pd.notna(x) and str(x).replace('.0','').isdigit() and int(x) > 0 else x)
 
     df_combined_options = pd.concat([df_stocks_only, df_options_only], ignore_index=True)
+    df_stocks_only["Source_Watchlists"] = watchlist_key
+    df_combined_options["Source_Watchlists"] = watchlist_key
     for col in df_stocks_only.columns:
         if col in sensitive_columns or any(s in col.lower() for s in ["p/l", "liq", "position"]): df_stocks_only[col] = "()"
     for col in df_combined_options.columns:
@@ -348,21 +427,31 @@ def main():
     print("📡 RUNNING WORKSPACE STEP 1 INGESTION ENGINE INITIALIZER")
     print(f"🎯 Selected Processing Ingestion Mode Type: [{INPUT_MODE.upper()}]")
     print("========================================================\n")
-    if INPUT_MODE == "generic":
+    if INPUT_MODE in {"generic", "all"}:
         current_date_str = datetime.now().strftime("%Y-%m-%d")
-        generate_synthetic_generic_watchlist(current_date_str)
-    else:
+        if INPUT_MODE == "generic":
+            generate_synthetic_generic_watchlist(current_date_str)
+
+    if INPUT_MODE in {"native", "all"}:
         try:
-            target_date = get_latest_date_from_files()
-            all_files = [Path(INPUT_DIR / f) for f in os.listdir(INPUT_DIR) if os.path.isfile(INPUT_DIR / f)]
-            target_keys = ["long", "allposition", "allopt", "asml", "core"]
-            matching_files = [f for f in all_files if target_date in f.name and any(key in f.name.lower() for key in target_keys)]
-            if not matching_files: return
-            for file_path in matching_files:
-                print(f"🚀 Ingesting Watchlist Dataset: {file_path.name}")
-                process_and_export_matrix(file_path, target_date)
+            raw_candidates = get_keyed_watchlist_files(max(
+                (metadata[0] for path in INPUT_DIR.iterdir() if (metadata := watchlist_metadata(path))),
+                default="",
+            )) if INPUT_DIR.exists() else []
+            matching_files = [path for path in raw_candidates if not path.stem.lower().endswith("_sanitized")]
+            if matching_files:
+                for file_path in matching_files:
+                    print(f"🚀 Ingesting Watchlist Dataset: {file_path.name}")
+                    process_and_export_matrix(file_path, watchlist_metadata(file_path)[0])
+            elif INPUT_MODE == "native":
+                print("🛰️ No raw keyed watchlists found; native mode has nothing to process.")
         except Exception as err:
             print(f"❌ Native script tracking halt error: {err}"); sys.exit(1)
+
+    if INPUT_MODE == "all":
+        telemetry_date = datetime.now().strftime("%Y-%m-%d")
+        print(f"🛰️ Generic telemetry output date: {telemetry_date} (processor run date).")
+        generate_synthetic_generic_watchlist(telemetry_date)
     print("\n💾 Step 1 pipeline processing complete. Clean files written to sanitized_watchlists.")
 
 if __name__ == "__main__":

@@ -8,20 +8,27 @@ import re
 import glob
 import logging
 import argparse
+import random
+from datetime import datetime
 import pandas as pd
 from pathlib import Path
 import yfinance as yf
+from local_data_store import LocalDataStore
 
 # Silence yfinance terminal internal warnings
 logging.getLogger('yfinance').setLevel(logging.CRITICAL)
 
 # Path Declarations: Aligned cleanly with your step 1 output folders
 BASE_DIR = Path(r"C:\Users\tcnet\TOS_Data_Local")
-INPUT_DIR = BASE_DIR / "sanitized_watchlists"
+PROJECT_DIR = Path(__file__).resolve().parents[1]
+INPUT_DIR = PROJECT_DIR / "data" / "sanitized_watchlists"
 OUTPUT_DIR = BASE_DIR / "sepa_matrix"
+DATABASE_PATH = PROJECT_DIR / "data" / "quant_terminal.db"
+SEPA_RESULTS_DIR = PROJECT_DIR / "output" / "sepa_results"
 
 # Ensure target directories exist
 OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+SEPA_RESULTS_DIR.mkdir(parents=True, exist_ok=True)
 
 # Broad Asset Translation Dictionary
 MACRO_MAP = {
@@ -30,21 +37,99 @@ MACRO_MAP = {
 }
 
 
-def get_latest_date_from_files() -> str:
-    """Scans sanitized folder for files containing YYYY-MM-DD pattern and returns the newest date."""
-    files = glob.glob(os.path.join(INPUT_DIR, "*.*"))
-    dates = []
-    for f in files:
-        match = re.search(r"(\d{4}-\d{2}-\d{2})", os.path.basename(f))
-        if match:
-            dates.append(match.group(1))
+def yahoo_history_ticker(symbol: str) -> str:
+    """Translate TOS futures, index aliases, and bracketed contracts for Yahoo."""
+    clean = str(symbol).strip().upper()
+    if clean in {"SPX", "^SPX"}:
+        return "^SPX"
+    if clean in {"VIX", "^VIX", "VX", "/VX"}:
+        return "^VIX"
+    if clean in {"VVIX", "^VVIX", "/VVIX"}:
+        return "^VVIX"
+    if clean.startswith("/"):
+        root_match = re.match(
+            r"^/(?P<root>[A-Z0-9]{1,4})(?:[FGHJKMNQUVXZ]\d{2}|\[[A-Z]\d{2}\])$",
+            clean,
+        )
+        if root_match is None:
+            root_match = re.match(r"^/(?P<root>[A-Z0-9]{1,4})", clean)
+        if root_match:
+            root = root_match.group("root")
+            if root == "VX":
+                return "^VIX"
+            if root == "VVIX":
+                return "^VVIX"
+            return f"{root}=F"
+    return MACRO_MAP.get(clean, clean)
 
-    if not dates:
+
+def get_latest_date_from_files() -> str:
+    """Return the newest native TOS session date, or generic date if native is absent."""
+    native_dates = []
+    all_dates = []
+    for path in glob.glob(os.path.join(INPUT_DIR, "*_SANITIZED.csv")):
+        name = os.path.basename(path)
+        match = re.search(r"(\d{4}-\d{2}-\d{2})", name)
+        if not match:
+            continue
+        date_value = match.group(1)
+        all_dates.append(date_value)
+        if "watchlist-generic" not in name.lower() and "watchlist_generic" not in name.lower():
+            native_dates.append(date_value)
+
+    if not all_dates:
         raise FileNotFoundError(f"❌ No valid dated files found in processed directory: {INPUT_DIR}")
 
-    latest_date = sorted(dates)[-1]
+    latest_date = max(native_dates or all_dates)
     print(f"📅 Auto-Detected Processed Target Date Context: {latest_date}")
     return latest_date
+
+
+def get_analysis_source_files(requested_key: str | None) -> list[Path]:
+    """Select latest native files plus the latest generic file for combined analysis."""
+    candidates = []
+    for path in Path(INPUT_DIR).glob("*.csv"):
+        if "-options" in path.name.lower():
+            continue
+        match = re.search(r"(\d{4}-\d{2}-\d{2})", path.name)
+        if not match:
+            continue
+        key_match = re.search(r"watchlist[-_]([A-Za-z0-9][A-Za-z0-9_-]*?)_SANITIZED\.csv$", path.name, re.IGNORECASE)
+        if key_match:
+            candidates.append((path, match.group(1), key_match.group(1).lower()))
+    if not candidates:
+        return []
+    if requested_key and requested_key != "all":
+        dates = [date for _, date, key in candidates if key == requested_key]
+        if not dates:
+            return []
+        target_date = max(dates)
+        return [path for path, date, key in candidates if date == target_date and key == requested_key]
+    native_dates = [date for _, date, key in candidates if key != "generic"]
+    native_date = max(native_dates) if native_dates else None
+    generic_dates = [date for _, date, key in candidates if key == "generic"]
+    generic_date = max(generic_dates) if generic_dates else None
+    return [
+        path for path, date, key in candidates
+        if (key != "generic" and date == native_date) or (key == "generic" and date == generic_date)
+    ]
+
+
+def history_to_store_bars(history: pd.DataFrame) -> list[tuple]:
+    """Convert a yfinance history frame into the local bar-store tuple format."""
+    if history.empty or "Close" not in history.columns:
+        return []
+    bars = []
+    for index, row in history.dropna(subset=["Close"]).iterrows():
+        def value(column: str):
+            raw = row.get(column)
+            return None if pd.isna(raw) else float(raw)
+        bars.append((
+            pd.Timestamp(index).date().isoformat(),
+            value("Open"), value("High"), value("Low"), value("Close"),
+            value("Adj Close"), value("Volume"),
+        ))
+    return bars
 """
 QUANT TERMINAL - Step 2: Integrated Multi-Regime SEPA Filter Matrix (Part 2/3)
 Runs multi-regime evaluation routines across fixed income, indicators, IPOs, and equities.
@@ -162,14 +247,16 @@ def evaluate_asset_trend(ticker_str: str, df_hist: pd.DataFrame) -> dict:
     yearly_low = df_hist['Low'].rolling(window=252).min().iloc[-1]
 
     # Minervini 7-Point Screening Rules (Stage 2 Uptrend Requirements)
-    fail_reasons = []
-    if not (current_price > sma_150 and current_price > sma_200): fail_reasons.append("R1:Price_Below_MAs")
-    if not (sma_150 > sma_200): fail_reasons.append("R2:SMA150_Below_SMA200")
-    if not sma_200_is_trending_up: fail_reasons.append("R3:SMA200_Slope_Down")
-    if not (sma_50 > sma_150 and sma_50 > sma_200): fail_reasons.append("R4:SMA50_Not_Stacked")
-    if not (current_price > sma_50): fail_reasons.append("R5:Price_Below_SMA50")
-    if not (current_price >= (yearly_low * 1.30)): fail_reasons.append("R6:Low_Prox_<30%")
-    if not (current_price >= (yearly_high * 0.75)): fail_reasons.append("R7:High_Prox_<25%")
+    criteria = {
+        "R1_Price_Above_SMA150_200": current_price > sma_150 and current_price > sma_200,
+        "R2_SMA150_Above_SMA200": sma_150 > sma_200,
+        "R3_SMA200_Trending_Up": sma_200_is_trending_up,
+        "R4_SMA50_Stacked": sma_50 > sma_150 and sma_50 > sma_200,
+        "R5_Price_Above_SMA50": current_price > sma_50,
+        "R6_Within_30Pct_Of_Year_Low": current_price >= yearly_low * 1.30,
+        "R7_Within_25Pct_Of_Year_High": current_price >= yearly_high * 0.75,
+    }
+    fail_reasons = [name for name, passed in criteria.items() if not passed]
     
     strict_sepa_pass = len(fail_reasons) == 0
     fail_string = "|".join(fail_reasons) if not strict_sepa_pass else "None"
@@ -224,6 +311,7 @@ def evaluate_asset_trend(ticker_str: str, df_hist: pd.DataFrame) -> dict:
         "Type": "Equity", "Strict_SEPA": strict_sepa_pass, "Cyclic_Turnaround": cyclic_turnaround_pass,
         "Stage1_Base": stage1_base_pass, "Stage3_Dist": stage3_dist_pass, "Stage4_Short": stage4_short_pass, 
         "Fail_Reason": fail_string, "Pass_Reason": pass_string, "Trend_Score": trend_score
+        , **criteria
     }
 """
 QUANT TERMINAL - Step 2: Integrated Multi-Regime SEPA Filter Matrix (Part 3/3)
@@ -320,5 +408,138 @@ def run_sepa_pipeline():
     print("\n💾 Step 2 matrix processing complete. Ready for Step 3 indicators calculation.\n")
 
 
+def run_sepa_diagnostic():
+    """Evaluate a small random sample from the local database before full rollout."""
+    parser = argparse.ArgumentParser(description="Run a local SEPA diagnostic sample")
+    parser.add_argument("--date", type=str, default=None, help="Target date string override (YYYY-MM-DD).")
+    parser.add_argument(
+        "--sample-size",
+        type=int,
+        default=None,
+        help="Unique non-option symbols to test; all symbols for allpos by default, 0 evaluates all symbols",
+    )
+    parser.add_argument("--seed", type=int, default=20260824, help="Stable random sample seed")
+    parser.add_argument("--history-period", type=str, default="2y", help="Fallback yfinance history period")
+    parser.add_argument("--download-missing", type=int, choices=(0, 1), default=1, help="Download when local bars are insufficient")
+    parser.add_argument("--offline", action="store_true", help="Use only local database bars; do not access Yahoo Finance")
+    parser.add_argument(
+        "--watchlist-key",
+        type=str,
+        default=None,
+        help="Select one keyed list, such as allpos, or all keyed lists with 'all'",
+    )
+    args = parser.parse_args()
+    if args.sample_size is not None and args.sample_size < 0:
+        parser.error("--sample-size cannot be negative")
+
+    requested_key = args.watchlist_key.lower().replace("allposition", "allpos") if args.watchlist_key else None
+    source_files = get_analysis_source_files(requested_key) if not args.date else [
+        path for path in get_analysis_source_files(requested_key)
+        if args.date in path.name
+    ]
+    target_date = args.date or get_latest_date_from_files()
+    if requested_key and requested_key != "all" and not source_files:
+        raise FileNotFoundError(
+            f"No sanitized watchlist found for key '{requested_key}'"
+        )
+    symbol_sources = {}
+    for path in source_files:
+        frame = pd.read_csv(path, encoding="utf-8-sig", on_bad_lines="skip")
+        if "Symbol" in frame.columns:
+            source_match = re.search(r"watchlist[-_]([A-Za-z0-9][A-Za-z0-9_-]*?)(?:_SANITIZED)?(?:-options)?\.csv$", path.name, re.IGNORECASE)
+            source_key = source_match.group(1).lower() if source_match else "unknown"
+            for symbol_value in frame["Symbol"].dropna():
+                symbol = str(symbol_value).strip().upper()
+                if symbol and not symbol.startswith("."):
+                    symbol_sources.setdefault(symbol, set()).add(source_key)
+    symbols = set(symbol_sources)
+    if not symbols:
+        raise FileNotFoundError(f"No non-option symbols found for {target_date} in {INPUT_DIR}")
+
+    rng = random.Random(args.seed)
+    effective_sample_size = args.sample_size
+    if effective_sample_size is None:
+        effective_sample_size = 0 if requested_key == "allpos" else 20
+
+    if effective_sample_size == 0 or len(symbols) <= effective_sample_size:
+        selected_symbols = sorted(symbols)
+    else:
+        selected_symbols = sorted(rng.sample(sorted(symbols), effective_sample_size))
+    store = LocalDataStore(DATABASE_PATH) if DATABASE_PATH.exists() else None
+    results = []
+    try:
+        for symbol in selected_symbols:
+            history = pd.DataFrame()
+            source = "missing"
+            if store is not None:
+                stored_rows = store.market_bars(symbol)
+                if stored_rows:
+                    history = pd.DataFrame(stored_rows, columns=["Date", "Open", "High", "Low", "Close", "Adj Close", "Volume"])
+                    source = "local_db"
+
+            if len(history) < 200 and args.download_missing == 1 and not args.offline:
+                yahoo_ticker = symbol
+                if symbol.startswith("/"):
+                    yahoo_ticker = f"{symbol[1:]}=F"
+                print(f"⚠️ {symbol}: local history has {len(history)} bars; requesting {args.history_period} from Yahoo as fallback.")
+                try:
+                    downloaded = yf.Ticker(yahoo_history_ticker(symbol)).history(period=args.history_period, interval="1d")
+                    if not downloaded.empty:
+                        history = downloaded.reset_index()
+                        history.columns = [str(column).replace(" ", "_") for column in history.columns]
+                        history.rename(columns={"Adj_Close": "Adj Close"}, inplace=True)
+                        source = "fallback_yahoo"
+                        if store is not None:
+                            try:
+                                if not store.market_data_coverage([symbol]):
+                                    asset_type = "future_or_index" if symbol.startswith("/") else "equity_or_fund"
+                                    store.upsert_asset(symbol, asset_type, None, target_date)
+                                asset_id = store.asset_id(symbol)
+                                store.save_bars(asset_id, history_to_store_bars(history.set_index("Date")))
+                                store.commit()
+                                print(f"   ↳ {symbol}: fallback history cached locally for future SEPA runs.")
+                            except (KeyError, ValueError) as error:
+                                print(f"   ⚠️ {symbol}: fallback history used but not cached ({error}).")
+                except Exception as error:
+                    print(f"⚠️ {symbol}: fallback history unavailable ({error}).")
+
+            metrics = evaluate_asset_trend(symbol, history)
+            if args.offline and len(history) < 200:
+                source = "missing_offline"
+            coverage = store.market_data_coverage([symbol])[0] if store is not None and store.market_data_coverage([symbol]) else {}
+            result = {
+                "Symbol": symbol,
+                "Source_Watchlists": "|".join(sorted(symbol_sources.get(symbol, set()))),
+                "Data_Source": source,
+                "Stored_Bars": coverage.get("bar_count", 0),
+                "Stored_First_Date": coverage.get("first_bar_date"),
+                "Stored_Last_Date": coverage.get("last_bar_date"),
+                "Evaluated_Bars": len(history),
+                "Stage": metrics.get("Pass_Reason", "No_Data"),
+                "Stage1_Base": metrics.get("Stage1_Base", False),
+                "Stage2_SEPA": metrics.get("Strict_SEPA", False),
+                "Stage3_Distribution": metrics.get("Stage3_Dist", False),
+                "Stage4_Downtrend": metrics.get("Stage4_Short", False),
+                "Fail_Reason": metrics.get("Fail_Reason", "No_Data"),
+                "Pass_Reason": metrics.get("Pass_Reason", "None"),
+                "Trend_Score": metrics.get("Trend_Score", 0.0),
+            }
+            result.update({name: metrics.get(name, False) for name in (
+                "R1_Price_Above_SMA150_200", "R2_SMA150_Above_SMA200", "R3_SMA200_Trending_Up",
+                "R4_SMA50_Stacked", "R5_Price_Above_SMA50", "R6_Within_30Pct_Of_Year_Low",
+                "R7_Within_25Pct_Of_Year_High",
+            )})
+            results.append(result)
+    finally:
+        if store is not None:
+            store.close()
+
+    stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    output_path = SEPA_RESULTS_DIR / f"{target_date}_SEPA_DIAGNOSTIC_{stamp}.csv"
+    pd.DataFrame(results).to_csv(output_path, index=False, encoding="utf-8-sig")
+    print(f"\n🧪 SEPA diagnostic complete: {len(results)} symbols -> {output_path}")
+    print("   Prior diagnostic files are preserved; no result file was overwritten.")
+
+
 if __name__ == "__main__":
-    run_sepa_pipeline()
+    run_sepa_diagnostic()

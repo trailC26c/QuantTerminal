@@ -39,8 +39,9 @@ W_MSAM = args.w_macro_sam
 # 📂 LOCAL WORKSPACE DIRECTORY STRUCTURE & ROUTING SPECIFICATIONS
 # =========================================================================
 BASE_DIR = r"C:\Users\tcnet\TOS_Data_Local"
+PROJECT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
-WATCHLIST_DIR = os.path.join(BASE_DIR, "sanitized_watchlists")
+WATCHLIST_DIR = os.path.join(PROJECT_DIR, "data", "sanitized_watchlists")
 SEPA_DIR = os.path.join(BASE_DIR, "sepa_matrix")
 OBV_DIR = os.path.join(BASE_DIR, "obv5_matrix")
 FUND_DIR = os.path.join(BASE_DIR, "fundamental_matrix")

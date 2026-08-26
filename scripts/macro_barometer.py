@@ -19,6 +19,7 @@ from pathlib import Path
 import pandas as pd
 import numpy as np
 import yfinance as yf
+from local_data_store import LocalDataStore
 import plotly.graph_objects as go
 import plotly.io as pio
 from plotly.subplots import make_subplots
@@ -78,6 +79,16 @@ parser.add_argument(
     default=20,
     help="Recent P4/P5 focus bars: 0=off (default: 20)"
 )
+parser.add_argument("--panel3_tmf", type=int, choices=(0, 1), default=1, help="Plot normalized TMF in Panel 3: 1=on, 0=off")
+parser.add_argument("--panel3_cvd", type=int, choices=(0, 1), default=0, help="Plot normalized CVD in Panel 3: 1=on, 0=off (default: off)")
+parser.add_argument("--panel3_cmf", type=int, choices=(0, 1), default=1, help="Plot normalized CMF in Panel 3: 1=on, 0=off")
+parser.add_argument("--panel3_kst", type=int, choices=(0, 1), default=1, help="Plot normalized KST in Panel 3: 1=on, 0=off")
+parser.add_argument(
+    "--data-source",
+    choices=("online", "local", "auto"),
+    default="local",
+    help="Market data source: local uses SQLite only (default); online preserves direct downloads; auto prefers local and backfills online",
+)
 
 args, unknown = parser.parse_known_args()
 
@@ -101,12 +112,13 @@ RECENT_OBV_SIGNAL_BARS = args.obv5_recent_bars
 # 📂 DIRECTORY STRUCTURE & ROUTING SPECIFICATIONS
 # =========================================================================
 BASE_DIR = r"C:\Users\tcnet\TOS_Data_Local"
-WATCHLIST_DIR = os.path.join(BASE_DIR, "sanitized_watchlists")
 
 PROJECT_DIR = Path(__file__).resolve().parents[1]
+WATCHLIST_DIR = str(PROJECT_DIR / "data" / "sanitized_watchlists")
 OUTPUT_DIR = str(PROJECT_DIR / "output")
 MACRO_DIR = OUTPUT_DIR
 CHARTS_DIR = str(PROJECT_DIR / "output" / "charts")
+DATABASE_PATH = PROJECT_DIR / "data" / "quant_terminal.db"
 
 LEGACY_MACRO_DIR = os.path.join(BASE_DIR, "macro_barometer")
 
@@ -169,6 +181,100 @@ def translate_tos_symbol(sym):
     return mapping.get(clean_sym, clean_sym)
 
 
+def history_to_store_bars(history):
+    """Convert an OHLCV frame into the local SQLite bar tuple format."""
+    if history.empty or "Close" not in history.columns:
+        return []
+    bars = []
+    for index, row in history.dropna(subset=["Close"]).iterrows():
+        def value(column):
+            raw = row.get(column)
+            return None if pd.isna(raw) else float(raw)
+        bars.append((
+            pd.Timestamp(index).date().isoformat(), value("Open"), value("High"),
+            value("Low"), value("Close"), value("Adj Close"), value("Volume"),
+        ))
+    return bars
+
+
+def load_macro_history(symbol, minimum_bars=400):
+    """Load macro OHLCV locally, online, or with local-first backfill."""
+    clean_symbol = str(symbol).strip().upper()
+    lookup_symbols = [clean_symbol]
+    translated = translate_tos_symbol(clean_symbol)
+    if translated not in lookup_symbols:
+        lookup_symbols.append(translated)
+
+    if args.data_source in ("local", "auto") and DATABASE_PATH.exists():
+        store = LocalDataStore(DATABASE_PATH)
+        try:
+            for lookup_symbol in lookup_symbols:
+                rows = store.market_bars(lookup_symbol)
+                if len(rows) >= minimum_bars:
+                    history = pd.DataFrame(
+                        rows,
+                        columns=["Date", "Open", "High", "Low", "Close", "Adj Close", "Volume"],
+                    )
+                    history["Date"] = pd.to_datetime(history["Date"])
+                    history = history.set_index("Date")
+                    print(f"   📚 {clean_symbol}: using {len(history)} local bars from SQLite.")
+                    return history
+                if rows:
+                    print(
+                        f"   ⚠️ {clean_symbol}: local history has {len(rows)} bars; "
+                        f"{minimum_bars} required for macro/OBV5 calculations."
+                    )
+        finally:
+            store.close()
+
+    if args.data_source == "local":
+        print(f"   ⏭️ {clean_symbol}: insufficient local history; skipping in local mode.")
+        return pd.DataFrame()
+
+    yahoo_symbol = translated
+    print(f"   🌐 {clean_symbol}: local history insufficient; backfilling 6y from Yahoo ({yahoo_symbol}).")
+    try:
+        downloaded = yf.download(yahoo_symbol, period="6y", auto_adjust=False, progress=False)
+    except Exception as error:
+        print(f"   ⚠️ {clean_symbol}: online backfill unavailable; skipping symbol ({error}).")
+        return pd.DataFrame()
+    if downloaded.empty:
+        print(f"   ⚠️ {clean_symbol}: online backfill returned no usable history; skipping symbol.")
+        return downloaded
+    if isinstance(downloaded.columns, pd.MultiIndex):
+        for level in range(downloaded.columns.nlevels):
+            level_values = {str(value) for value in downloaded.columns.get_level_values(level)}
+            if "Close" in level_values:
+                downloaded.columns = downloaded.columns.get_level_values(level)
+                break
+    downloaded.columns = [str(column) for column in downloaded.columns]
+
+    if DATABASE_PATH.parent.exists():
+        store = LocalDataStore(DATABASE_PATH)
+        try:
+            asset_id = store.upsert_asset(clean_symbol, "future_or_index" if clean_symbol.startswith("/") else "equity_or_fund", None, datetime.now().strftime("%Y-%m-%d"))
+            store.save_bars(asset_id, history_to_store_bars(downloaded))
+            store.commit()
+        finally:
+            store.close()
+    if len(downloaded) < minimum_bars:
+        print(
+            f"   ⚠️ {clean_symbol}: backfill cached {len(downloaded)} bars, "
+            f"but {minimum_bars} are required; result remains short-history."
+        )
+    else:
+        print(f"   ✅ {clean_symbol}: backfill cached with {len(downloaded)} bars in SQLite.")
+    return downloaded
+
+
+def close_series(history):
+    """Return a single Close series from local or Yahoo-shaped history."""
+    if history.empty or "Close" not in history.columns:
+        return pd.Series(dtype="float64")
+    close = history["Close"]
+    return close.iloc[:, 0] if isinstance(close, pd.DataFrame) else close
+
+
 def min_max_normalize_shifted_series(window, shift, series):
     """Calculates static bounds across defined blocks to enforce continuous curves."""
     total_len = len(series)
@@ -179,6 +285,63 @@ def min_max_normalize_shifted_series(window, shift, series):
     h_max = boundary_range_subset.max()
     denom = h_max - h_min if (h_max - h_min) != 0 else 1.0
     return pd.Series(SCALE_MIN + ((series - h_min) / denom) * (SCALE_MAX - SCALE_MIN), index=series.index)
+
+
+def normalize_panel3_series(series, range_param, shift_param):
+    """Normalize one Panel 3 series using the fixed historical-to-latest window."""
+    end_idx = len(series) - shift_param
+    start_idx = max(0, end_idx - range_param)
+    window = series.iloc[start_idx:end_idx].dropna()
+    if window.empty:
+        return pd.Series(np.nan, index=series.index)
+
+    minimum = float(window.min())
+    maximum = float(window.max())
+    denominator = maximum - minimum
+    if denominator == 0:
+        return pd.Series(SCALE_MIN, index=series.index)
+
+    return SCALE_MIN + (
+        (series - minimum) / denominator
+    ) * (SCALE_MAX - SCALE_MIN)
+
+
+def compute_kst(close):
+    """Compute the standard four-ROC Know Sure Thing oscillator."""
+    def roc(period):
+        previous = close.shift(period).replace(0, np.nan)
+        return ((close - previous) / previous) * 100.0
+
+    sroc1 = roc(10).rolling(10).mean()
+    sroc2 = roc(15).rolling(10).mean()
+    sroc3 = roc(20).rolling(10).mean()
+    sroc4 = roc(30).rolling(15).mean()
+    return sroc1 + (2.0 * sroc2) + (3.0 * sroc3) + (4.0 * sroc4)
+
+
+def compute_money_flow_oscillator(high, low, close, volume, period):
+    """Compute a Chaikin-style money-flow oscillator with safe zero-range handling."""
+    price_range = (high - low).replace(0, np.nan)
+    money_flow_multiplier = ((close - low) - (high - close)) / price_range
+    money_flow_volume = money_flow_multiplier * volume
+    volume_sum = volume.rolling(period).sum().replace(0, np.nan)
+    return money_flow_volume.rolling(period).sum() / volume_sum
+
+
+def compute_tmf(high, low, close, volume, period=21):
+    """Compute Twiggs Money Flow."""
+    return compute_money_flow_oscillator(high, low, close, volume, period)
+
+
+def compute_cmf(high, low, close, volume, period=20):
+    """Compute Chaikin Money Flow."""
+    return compute_money_flow_oscillator(high, low, close, volume, period)
+
+
+def compute_cvd(close, volume):
+    """Compute directional-volume CVD approximation from daily OHLCV data."""
+    direction = np.sign(close.diff()).fillna(0.0)
+    return (direction * volume).cumsum()
 
 
 def compute_raw_obv_vector(close_series, volume_series):
@@ -388,7 +551,10 @@ def generate_unified_two_pane_chart(symbol, anchors, consensus_positions, curren
     
     try:
         # Pull 6 years of deep history to provide complete lookback cushions
-        px_raw = yf.download(tick_lookup, period="6y", auto_adjust=False, progress=False)
+        px_raw = load_macro_history(clean_sym)
+        if px_raw.empty:
+            print(f"   ⚠️ No usable market history for {lbl_sym}; skipping chart.")
+            return
         close_ser = px_raw['Close'].iloc[:, 0] if isinstance(px_raw['Close'], pd.DataFrame) else px_raw['Close']
         vol_ser = px_raw['Volume'].iloc[:, 0] if isinstance(px_raw['Volume'], pd.DataFrame) else px_raw['Volume']
         open_ser = px_raw['Open'].iloc[:, 0] if isinstance(px_raw['Open'], pd.DataFrame) else px_raw['Open']
@@ -410,6 +576,18 @@ def generate_unified_two_pane_chart(symbol, anchors, consensus_positions, curren
         
         # --- THE PHYSICAL ACCELERATOR: RAW OBV5 ANALYSIS LOOP ---
         df_p['raw_obv'] = compute_raw_obv_vector(df_p['Close'], df_p['Volume'])
+        df_p['tmf'] = compute_tmf(
+            df_p['High'], df_p['Low'], df_p['Close'], df_p['Volume']
+        )
+        df_p['cmf'] = compute_cmf(
+            df_p['High'], df_p['Low'], df_p['Close'], df_p['Volume']
+        )
+        df_p['cvd'] = compute_cvd(df_p['Close'], df_p['Volume'])
+        df_p['kst'] = compute_kst(df_p['Close'])
+        for indicator_name in ('tmf', 'cmf', 'cvd', 'kst'):
+            df_p[f'norm_{indicator_name}'] = normalize_panel3_series(
+                df_p[indicator_name], PLOT_RANGE, SHIFT_BARS
+            )
         
         buy_marker_stack = {}
         sell_marker_stack = {}
@@ -488,7 +666,7 @@ def generate_unified_two_pane_chart(symbol, anchors, consensus_positions, curren
             rows=2, cols=1, shared_xaxes=True, vertical_spacing=0.05,
             row_heights=[0.6, 0.4],
             specs=[[{"secondary_y": True}], [{"secondary_y": True}]],
-            subplot_titles=("Panel 1: Asset price (raw/norm), VIX, UUP norm", "Panel 2: Delta norm Asset to norm VIX, UUP, SMA<n>")
+            subplot_titles=("Panel 1: Asset price (raw/norm), VIX, UUP norm", "Panel 2: Delta norm Asset to norm VIX, UUP, SMAn")
         )
         x_vals = timeline_x.tolist()
         
@@ -743,7 +921,7 @@ def generate_unified_two_pane_chart(symbol, anchors, consensus_positions, curren
             "font": {"size": 14, "color": "#FFFFFF"}
         }]
         panel_2_annotations = [{
-            "text": "Panel 2: Delta norm Asset to norm VIX, UUP, SMA<n>",
+            "text": "Panel 2: Delta norm Asset to norm VIX, UUP, SMAn",
             "xref": "paper",
             "yref": "paper",
             "x": 0.5,
@@ -917,8 +1095,8 @@ def generate_unified_two_pane_chart(symbol, anchors, consensus_positions, curren
             yaxis4_domain=[0.0, 0.38],
             yaxis=dict(title_text="Norm Asset/VIX/UUP"),
             yaxis2=dict(title_text="Raw Asset price ($)"),
-            yaxis3=dict(title_text="Delta Norm Asset to Norm VIX/UUP"),
-            yaxis4=dict(title_text="Norm OBV (range)"),
+            yaxis3=dict(title_text="Delta Norm Asset to Norm VIX/UUP/SMAn"),
+            yaxis4=dict(title_text="Norm OBV"),
             xaxis=dict(
                 type="linear",
                 range=reset_x_range,
@@ -1191,12 +1369,19 @@ def generate_unified_two_pane_chart(symbol, anchors, consensus_positions, curren
             axis_map,
             primary_range,
             secondary_range,
-            secondary_trace_names=None
+            secondary_trace_names=None,
+            optional_trace_flags=None,
+            source_traces=None
         ):
             secondary_trace_names = set(secondary_trace_names or ())
+            optional_trace_flags = optional_trace_flags or {}
+            source_traces = fig.data if source_traces is None else source_traces
             focus_traces = []
-            for source_trace in fig.data[trace_start:trace_end]:
+            for source_trace in source_traces[trace_start:trace_end]:
                 trace_json = source_trace.to_plotly_json()
+                trace_name = trace_json.get("name")
+                if trace_name in optional_trace_flags and not optional_trace_flags[trace_name]:
+                    continue
                 trace_json["xaxis"] = "x"
                 trace_json["yaxis"] = (
                     "y2"
@@ -1240,7 +1425,7 @@ def generate_unified_two_pane_chart(symbol, anchors, consensus_positions, curren
                     title_text=(
                         "Norm Asset/VIX/UUP"
                         if "Panel 1" in title
-                        else "Delta Norm Asset to Norm VIX/UUP"
+                        else "Delta Norm Asset to Norm VIX/UUP/SMAn"
                     ),
                     range=primary_range,
                     autorange=False,
@@ -1251,7 +1436,7 @@ def generate_unified_two_pane_chart(symbol, anchors, consensus_positions, curren
                     title_text=(
                         "Raw Asset price ($)"
                         if "Panel 1" in title
-                        else "Norm OBV (range)"
+                        else "Norm OBV"
                     ),
                     range=secondary_range,
                     autorange=False,
@@ -1286,6 +1471,64 @@ def generate_unified_two_pane_chart(symbol, anchors, consensus_positions, curren
             panel_2_primary_range,
             panel_2_secondary_range
         )
+        panel_3_traces = [
+            go.Scatter(
+                x=x_vals,
+                y=df_slice["norm_OBV_wave"].tolist(),
+                name="norm OBV5",
+                yaxis="y2",
+                line=dict(color="#4D96FF", width=1.0)
+            ),
+            go.Scatter(
+                x=x_vals,
+                y=df_slice["norm_tmf"].tolist(),
+                name="norm TMF",
+                yaxis="y",
+                line=dict(color="#FF9500", width=1.5)
+            ),
+            go.Scatter(
+                x=x_vals,
+                y=df_slice["norm_cvd"].tolist(),
+                name="norm CVD",
+                yaxis="y",
+                line=dict(color="#AF52DE", width=1.0)
+            ),
+            go.Scatter(
+                x=x_vals,
+                y=df_slice["norm_cmf"].tolist(),
+                name="norm CMF",
+                yaxis="y",
+                line=dict(color="#00FF66", width=1.5)
+            ),
+            go.Scatter(
+                x=x_vals,
+                y=df_slice["norm_kst"].tolist(),
+                name="norm KST",
+                yaxis="y",
+                line=dict(color="#FF3B30", width=1.5)
+            )
+        ]
+        panel_3_primary_values = np.concatenate([
+            np.asarray(df_slice[f"norm_{name}"].dropna(), dtype=float)
+            for name in ("tmf", "cvd", "cmf", "kst")
+        ])
+        panel_3_primary_range = _padded_range(panel_3_primary_values)
+        panel_3_fig = build_focus_figure(
+            0,
+            len(panel_3_traces),
+            f"QUANT MATRIX TERMINAL: {lbl_sym} - Panel 3",
+            {"y": "y", "y2": "y2"},
+            panel_3_primary_range,
+            panel_2_secondary_range,
+            source_traces=panel_3_traces,
+            secondary_trace_names={"norm OBV5"},
+            optional_trace_flags={
+                "norm TMF": bool(args.panel3_tmf),
+                "norm CVD": bool(args.panel3_cvd),
+                "norm CMF": bool(args.panel3_cmf),
+                "norm KST": bool(args.panel3_kst),
+            }
+        )
 
         debug_path = f"{output_chart_path}.panel1-debug.json"
         if args.debug_chart:
@@ -1306,6 +1549,7 @@ def generate_unified_two_pane_chart(symbol, anchors, consensus_positions, curren
         )
         panel_1_html = pio.to_html(panel_1_fig, full_html=False, include_plotlyjs=False)
         panel_2_html = pio.to_html(panel_2_fig, full_html=False, include_plotlyjs=False)
+        panel_3_html = pio.to_html(panel_3_fig, full_html=False, include_plotlyjs=False)
         tabbed_html = f"""<!doctype html>
 <html>
 <head><meta charset="utf-8"><title>QUANT MATRIX TERMINAL: {lbl_sym}</title>
@@ -1322,11 +1566,13 @@ body {{ margin: 0; background: #1C1C1E; color: #FFFFFF; font-family: monospace; 
     <button class="qt-tab active" data-view="dual">Dual Panel</button>
     <button class="qt-tab" data-view="panel1">Panel 1</button>
     <button class="qt-tab" data-view="panel2">Panel 2</button>
+    <button class="qt-tab" data-view="panel3">Panel 3</button>
 </nav>
 <main>
     <section id="dual" class="qt-view active">{dual_html}</section>
     <section id="panel1" class="qt-view">{panel_1_html}</section>
     <section id="panel2" class="qt-view">{panel_2_html}</section>
+    <section id="panel3" class="qt-view">{panel_3_html}</section>
 </main>
 <script>
 document.querySelectorAll('.qt-tab').forEach((tab) => tab.addEventListener('click', () => {{
@@ -1348,6 +1594,93 @@ document.querySelectorAll('.qt-tab').forEach((tab) => tab.addEventListener('clic
         print(f"   ⚠️ Visual Engine Exception for {lbl_sym}: {e}")
         traceback.print_exc()
 
+
+def write_chart_viewer():
+    """Create a local, keyboard-friendly viewer for the generated chart pages."""
+    chart_names = sorted(
+        name for name in os.listdir(CHARTS_DIR)
+        if name.lower().endswith(".html") and name != "chart_viewer.html"
+    )
+    viewer_path = os.path.join(CHARTS_DIR, "chart_viewer.html")
+    chart_data = json.dumps(chart_names)
+    viewer_html = f"""<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Quant Terminal Chart Viewer</title>
+<style>
+body {{ margin: 0; background: #17181b; color: #f5f5f7; font-family: Consolas, monospace; }}
+.toolbar {{ display: flex; align-items: center; gap: 10px; padding: 10px 14px; background: #24262b; position: sticky; top: 0; z-index: 2; }}
+button, select {{ border: 1px solid #626873; background: #353941; color: #fff; padding: 8px 12px; font: inherit; cursor: pointer; }}
+button:disabled {{ cursor: default; opacity: .45; }}
+select {{ min-width: 260px; max-width: 48vw; }}
+#counter {{ min-width: 95px; text-align: center; }}
+iframe {{ display: block; width: 100%; height: calc(100vh - 58px); border: 0; }}
+@media (max-width: 650px) {{ .toolbar {{ gap: 6px; padding: 8px; }} button, select {{ padding: 7px 8px; }} select {{ min-width: 0; flex: 1; }} #counter {{ min-width: 70px; }} }}
+</style>
+</head>
+<body>
+<nav class="toolbar" aria-label="Chart navigation">
+    <button id="previous" type="button" title="Previous chart (Left Arrow)">&larr; Previous</button>
+    <button id="next" type="button" title="Next chart (Right Arrow)">Next &rarr;</button>
+    <span id="counter" aria-live="polite"></span>
+    <select id="chart-select" aria-label="Select chart"></select>
+</nav>
+<iframe id="chart-frame" title="Selected chart"></iframe>
+<div id="frame-error" role="alert" hidden>Unable to load this chart. It may have been moved or removed.</div>
+<script>
+const charts = {chart_data};
+const frame = document.getElementById('chart-frame');
+const select = document.getElementById('chart-select');
+const counter = document.getElementById('counter');
+const previous = document.getElementById('previous');
+const next = document.getElementById('next');
+const frameError = document.getElementById('frame-error');
+let current = 0;
+
+charts.forEach((name, index) => {{
+    const option = document.createElement('option');
+    option.value = index;
+    option.textContent = name;
+    select.appendChild(option);
+}});
+
+function showChart(index) {{
+    if (!charts.length) {{
+        counter.textContent = 'No charts';
+        previous.disabled = true;
+        next.disabled = true;
+        return;
+    }}
+    current = Math.max(0, Math.min(index, charts.length - 1));
+    frameError.hidden = true;
+    frame.src = encodeURI(charts[current]);
+    select.value = String(current);
+    counter.textContent = `${{current + 1}} / ${{charts.length}}`;
+    previous.disabled = current === 0;
+    next.disabled = current === charts.length - 1;
+}}
+
+frame.addEventListener('error', () => {{
+    frameError.hidden = false;
+}});
+
+previous.addEventListener('click', () => showChart(current - 1));
+next.addEventListener('click', () => showChart(current + 1));
+select.addEventListener('change', () => showChart(Number(select.value)));
+document.addEventListener('keydown', (event) => {{
+    if (event.key === 'ArrowLeft') showChart(current - 1);
+    if (event.key === 'ArrowRight') showChart(current + 1);
+}});
+showChart(0);
+</script>
+</body>
+</html>"""
+    with open(viewer_path, "w", encoding="utf-8") as viewer_file:
+        viewer_file.write(viewer_html)
+    print(f"🖼️ Chart viewer generated -> {viewer_path}")
+
 """
 QUANT TERMINAL - Step 5: Real-Time Multi-Regime Macro Barometer Dashboard
 Block 5 of 6: Central Pipeline Orchestration and Broad Anchor Data Harvesters.
@@ -1365,12 +1698,18 @@ def run_macro_barometer_pipeline():
     current_run_date = datetime.now().strftime("%Y-%m-%d")
     index_symbols, alpha_singles = parse_telemetry_config()
     
-    print("📡 Ingesting Risk Anchors (^VIX, UUP) from yfinance...")
-    vix_df = yf.download('^VIX', period="6y", auto_adjust=False, progress=False)
-    uup_df = yf.download('UUP', period="6y", auto_adjust=False, progress=False)
+    print(f"📡 Ingesting Risk Anchors (^VIX, UUP) via {args.data_source} data source...")
+    vix_df = load_macro_history('^VIX')
+    uup_df = load_macro_history('UUP')
+    if vix_df.empty or uup_df.empty:
+        print("⚠️ Macro anchor history is unavailable; stopping without generating incomplete ledgers.")
+        return
     
-    ser_vix = vix_df['Close'].iloc[:, 0] if isinstance(vix_df['Close'], pd.DataFrame) else vix_df['Close']
-    ser_uup = uup_df['Close'].iloc[:, 0] if isinstance(uup_df['Close'], pd.DataFrame) else uup_df['Close']
+    ser_vix = close_series(vix_df)
+    ser_uup = close_series(uup_df)
+    if ser_vix.empty or ser_uup.empty:
+        print("⚠️ Macro anchor data returned without usable Close columns; stopping safely.")
+        return
     
     anchors = pd.DataFrame(index=vix_df.index)
     anchors['VIX_Close'] = ser_vix
@@ -1392,6 +1731,7 @@ def run_macro_barometer_pipeline():
     if alpha_singles:
         for sym in alpha_singles:
             generate_unified_two_pane_chart(sym, anchors, consensus_positions, current_run_date)
+    write_chart_viewer()
     """
     QUANT TERMINAL - Step 5: Real-Time Multi-Regime Macro Barometer Dashboard
     Block 6 of 6: Symmetrical Ledger Exporter with Precision Timeline Bar String Logs.
@@ -1409,7 +1749,10 @@ def run_macro_barometer_pipeline():
     
     for tick in core_equity_anchors:
         try:
-            raw_px = yf.download(tick, period="6y", auto_adjust=False, progress=False)
+            raw_px = load_macro_history(tick)
+            if raw_px.empty:
+                print(f"   ⚠️ No local/online history for {tick}; skipping macro ledger row.")
+                continue
             close_ser = raw_px['Close'].iloc[:, 0] if isinstance(raw_px['Close'], pd.DataFrame) else raw_px['Close']
             vol_ser = raw_px['Volume'].iloc[:, 0] if isinstance(raw_px['Volume'], pd.DataFrame) else raw_px['Volume']
             

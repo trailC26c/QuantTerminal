@@ -16,7 +16,9 @@ import logging
 logging.getLogger('yfinance').setLevel(logging.CRITICAL)
 
 # 📌 Directory Realignment: Updated to your new QuanTerminal pipeline structure
-PROCESSED_DIR = r"C:\Users\tcnet\TOS_Data_Local\sanitized_watchlists"
+# 📌 Directory Realignment: Raw input remains external; sanitized input is project-local
+PROJECT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+PROCESSED_DIR = os.path.join(PROJECT_DIR, "data", "sanitized_watchlists")
 OUTPUT_DIR = r"C:\Users\tcnet\TOS_Data_Local\obv5_matrix"
 
 os.makedirs(OUTPUT_DIR, exist_ok=True)

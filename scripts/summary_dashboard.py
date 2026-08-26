@@ -17,7 +17,8 @@ import pandas as pd
 # 📂 REPOSITORY TRACKING SPECIFICATIONS
 # =========================================================================
 BASE_DIR = r"C:\Users\tcnet\TOS_Data_Local"
-WATCHLIST_DIR = os.path.join(BASE_DIR, "sanitized_watchlists")
+PROJECT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+WATCHLIST_DIR = os.path.join(PROJECT_DIR, "data", "sanitized_watchlists")
 MACRO_DIR = os.path.join(BASE_DIR, "macro_barometer")
 INPUT_DIR = os.path.join(BASE_DIR, "master_leaderboard")
 OUTPUT_DIR = os.path.join(BASE_DIR, "master_leaderboard")
