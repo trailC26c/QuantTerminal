@@ -424,13 +424,27 @@ python scripts/obv5_signal_engine.py --symbols all --data-source online
 python scripts/obv5_signal_engine.py --symbols all --data-source local
 ```
 
+Prefer `--data-source auto` for routine refreshes; it downloads only the
+symbols whose local history is missing or too short, then caches the result:
+
+```powershell
+python scripts/obv5_signal_engine.py --symbols all --data-source auto --recent_bars 7
+```
+
 Each run preserves timestamped files under `output/obv5_engine/`:
 
 ```text
-<date>_OBV5_SIGNALS_<time>.csv       detailed event-level signal ledger
-<date>_OBV5_SUMMARY_<time>.csv       complete symbol-universe scanner
-<date>_OBV5_LATEST3_HITS_<time>.csv  symbols with a signal in the latest 3 bars
+<date>_OBV5_SIGNALS_<time>.csv                detailed event-level signal ledger
+<date>_OBV5_SUMMARY_<time>.csv                complete symbol-universe scanner
+<date>_OBV5_LATEST3_HITS_P4_ALL_<time>.csv    P1-P4 signals only
+<date>_OBV5_LATEST3_HITS_P5_EXT_<time>.csv    P5 global extrema, no local turns
+<date>_OBV5_LATEST3_HITS_P5_ALL_<time>.csv    every signal, including local turns
 ```
+
+Each variant recomputes its own recent-signal count, `Latest_Signals_3B`, and
+`Latest_Signal_Periods_3B` from its own signal subset, so the counts and detail
+tokens stay internally consistent rather than being filtered leftovers of the
+full set.
 
 The full summary includes every processed symbol, including symbols with no
 recent signals. Its recent-signal count is dynamically named according to the
@@ -459,6 +473,19 @@ rule. Run the standalone engine locally with:
 ```powershell
 python scripts/obv5_signal_engine.py --data-source local
 ```
+
+The variants exist because P5 local turns are deliberately sensitive and can
+dominate the most recent bars, while P1-P4 window extrema are comparatively
+stable. A representative `--recent_bars 7` run over 446 symbols produced:
+
+```text
+P5_ALL   313 symbols
+P5_EXT    92 symbols
+P4_ALL    59 symbols
+```
+
+The intended usage order is `P4_ALL` for near-action review, `P5_EXT` for
+earlier scouting, and `P5_ALL` as the experimental reference set.
 
 ### OBV5 Calibration And Simulation
 
@@ -754,3 +781,24 @@ direct-download path as an explicit safety option. OBV5 and delta calculations
 now use the modular local-first engines, and analysis should report
 insufficient local coverage explicitly rather than silently reaching the
 network.
+
+Two offline conventions are in use. `processor.py`, `sepa_matrix.py`, and
+`fundamental_analyzer.py` take an `--offline` switch, while
+`macro_barometer.py` and `obv5_signal_engine.py` take `--data-source`. There
+is no `--data-source offline`; the equivalent is `--data-source local`:
+
+```powershell
+python scripts/sepa_matrix.py --watchlist-key all --sample-size 0 --offline
+python scripts/obv5_signal_engine.py --symbols all --data-source local
+```
+
+A full local-first refresh runs acquisition before analysis, because the hits
+variants and chart universe are only rebuilt when their producing script runs:
+
+```powershell
+python scripts/processor.py --input all
+python scripts/sepa_matrix.py --watchlist-key all --sample-size 0 --download-missing 1
+python scripts/fundamental_analyzer.py --watchlist-key all --force-refresh
+python scripts/obv5_signal_engine.py --symbols all --data-source auto --recent_bars 7
+python scripts/macro_barometer.py --data-source auto --obv5-candidates p4_all
+```
