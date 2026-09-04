@@ -249,7 +249,7 @@ def execute_master_ranker_pipeline():
         filename = os.path.basename(filepath)
         clean_name = filename.replace(".csv", "")
         if "-options" in clean_name.lower() or "_options" in clean_name.lower(): continue
-        token_match = re.search(r"watchlist-[a-zA-Z0-9_]+", clean_name)
+        token_match = re.search(r"watchlist-[a-zA-Z0-9_+\-]+", clean_name)
         if not token_match: continue
         core_token = token_match.group(0).replace("watchlist-", "").replace("_SANITIZED", "")
         print(f"📈 [Cross-Module Sync Loop] -> Compiling Watchlist Matrix: [{core_token}]")

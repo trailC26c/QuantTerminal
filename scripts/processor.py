@@ -76,7 +76,7 @@ def get_latest_date_from_files() -> str:
 
 
 WATCHLIST_PATTERN = re.compile(
-    r"^(?P<date>\d{4}-\d{2}-\d{2})[-_]watchlist[-_](?P<key>[A-Za-z0-9][A-Za-z0-9_-]*?)(?:_SANITIZED(?:-options)?)?\.csv$",
+    r"^(?P<date>\d{4}-\d{2}-\d{2})[-_]watchlist[-_](?P<key>[A-Za-z0-9][A-Za-z0-9_+\-]*?)(?:_SANITIZED(?:-options)?)?\.csv$",
     re.IGNORECASE,
 )
 

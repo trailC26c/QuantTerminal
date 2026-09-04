@@ -23,7 +23,7 @@ SANITIZED_DIR = PROJECT_DIR / "data" / "sanitized_watchlists"
 DATABASE_PATH = PROJECT_DIR / "data" / "quant_terminal.db"
 PROGRESS_PATH = PROJECT_DIR / "data" / "market_db_build_progress.json"
 FILE_PATTERN = re.compile(
-    r"^(?P<date>\d{4}-\d{2}-\d{2})[-_]watchlist[-_](?P<key>[A-Za-z0-9][A-Za-z0-9_-]*?)(?:_SANITIZED(?:-options)?)?\.csv$",
+    r"^(?P<date>\d{4}-\d{2}-\d{2})[-_]watchlist[-_](?P<key>[A-Za-z0-9][A-Za-z0-9_+\-]*?)(?:_SANITIZED(?:-options)?)?\.csv$",
     re.IGNORECASE,
 )
 OPTION_PATTERN = re.compile(r"^\.[A-Za-z]+\d{6}")

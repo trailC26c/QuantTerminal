@@ -65,7 +65,7 @@ def generate_lightweight_summary_cockpit():
             fname = os.path.basename(f)
             if "-options" in fname.lower() or "_options" in fname.lower():
                 continue
-            token_match = re.search(r"watchlist-[a-zA-Z0-9_]+", fname.lower())
+            token_match = re.search(r"watchlist-[a-zA-Z0-9_+\-]+", fname.lower())
             if not token_match: continue
             list_label = token_match.group(0).replace("watchlist-", "").replace("_sanitized", "").strip()
             

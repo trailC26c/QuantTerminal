@@ -87,6 +87,30 @@ CREATE TABLE IF NOT EXISTS obv5_signals (
 CREATE INDEX IF NOT EXISTS idx_obv5_signals_asset_date
     ON obv5_signals (asset_id, signal_date);
 
+CREATE TABLE IF NOT EXISTS delta_metrics (
+    asset_id INTEGER NOT NULL REFERENCES assets(asset_id),
+    bar_date TEXT NOT NULL,
+    normalization_window INTEGER NOT NULL,
+    range_bars INTEGER NOT NULL,
+    shift_bars INTEGER NOT NULL,
+    asset_close REAL,
+    vix_close REAL,
+    uup_close REAL,
+    sma_close REAL,
+    norm_asset REAL,
+    norm_vix REAL,
+    norm_uup REAL,
+    norm_sma REAL,
+    delta_vix REAL,
+    delta_uup REAL,
+    delta_sma REAL,
+    generated_at TEXT NOT NULL,
+    PRIMARY KEY (asset_id, bar_date, normalization_window, range_bars, shift_bars)
+);
+
+CREATE INDEX IF NOT EXISTS idx_delta_metrics_asset_date
+    ON delta_metrics (asset_id, bar_date);
+
 CREATE TABLE IF NOT EXISTS build_runs (
     run_id TEXT PRIMARY KEY,
     started_at TEXT NOT NULL,
@@ -292,6 +316,13 @@ class LocalDataStore:
         ).fetchall()
         return rows
 
+    def known_symbols(self) -> list[str]:
+        """Return all locally known asset symbols in stable order."""
+        rows = self.connection.execute(
+            "SELECT symbol FROM assets ORDER BY symbol"
+        ).fetchall()
+        return [str(row[0]) for row in rows]
+
     def get_fundamental_snapshot(self, symbol: str, max_age_days: int) -> dict[str, Any] | None:
         """Return a recent fundamental snapshot, or None when it needs refresh."""
         row = self.connection.execute(
@@ -357,6 +388,65 @@ class LocalDataStore:
             ],
         )
         return len(rows)
+
+    def save_delta_metrics(self, asset_id: int, metrics: Iterable[dict[str, Any]]) -> int:
+        """Upsert normalized daily delta metrics for one asset and parameter set."""
+        rows = list(metrics)
+        self.connection.executemany(
+            """INSERT INTO delta_metrics
+               (asset_id, bar_date, normalization_window, range_bars, shift_bars,
+                asset_close, vix_close, uup_close, sma_close, norm_asset, norm_vix,
+                norm_uup, norm_sma, delta_vix, delta_uup, delta_sma, generated_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+               ON CONFLICT(asset_id, bar_date, normalization_window, range_bars, shift_bars)
+               DO UPDATE SET asset_close = excluded.asset_close,
+                   vix_close = excluded.vix_close, uup_close = excluded.uup_close,
+                   sma_close = excluded.sma_close, norm_asset = excluded.norm_asset,
+                   norm_vix = excluded.norm_vix, norm_uup = excluded.norm_uup,
+                   norm_sma = excluded.norm_sma, delta_vix = excluded.delta_vix,
+                   delta_uup = excluded.delta_uup, delta_sma = excluded.delta_sma,
+                   generated_at = excluded.generated_at""",
+            [
+                (
+                    asset_id, metric["bar_date"], metric["normalization_window"],
+                    metric["range_bars"], metric["shift_bars"], metric.get("asset_close"),
+                    metric.get("vix_close"), metric.get("uup_close"), metric.get("sma_close"),
+                    metric.get("norm_asset"), metric.get("norm_vix"), metric.get("norm_uup"),
+                    metric.get("norm_sma"), metric.get("delta_vix"), metric.get("delta_uup"),
+                    metric.get("delta_sma"), utc_now(),
+                )
+                for metric in rows
+            ],
+        )
+        return len(rows)
+
+    def delta_metrics(
+        self,
+        symbol: str,
+        normalization_window: int,
+        range_bars: int,
+        shift_bars: int,
+    ) -> list[dict[str, Any]]:
+        """Return stored delta metrics for one symbol and exact calculation parameters."""
+        rows = self.connection.execute(
+            """SELECT dm.bar_date, dm.normalization_window, dm.range_bars, dm.shift_bars,
+                      dm.asset_close, dm.vix_close, dm.uup_close, dm.sma_close,
+                      dm.norm_asset, dm.norm_vix, dm.norm_uup, dm.norm_sma,
+                      dm.delta_vix, dm.delta_uup, dm.delta_sma, dm.generated_at
+               FROM delta_metrics AS dm
+               JOIN assets AS a ON a.asset_id = dm.asset_id
+               WHERE a.symbol = ? AND dm.normalization_window = ?
+                 AND dm.range_bars = ? AND dm.shift_bars = ?
+               ORDER BY dm.bar_date""",
+            (symbol, normalization_window, range_bars, shift_bars),
+        ).fetchall()
+        columns = (
+            "bar_date", "normalization_window", "range_bars", "shift_bars",
+            "asset_close", "vix_close", "uup_close", "sma_close", "norm_asset",
+            "norm_vix", "norm_uup", "norm_sma", "delta_vix", "delta_uup",
+            "delta_sma", "generated_at",
+        )
+        return [dict(zip(columns, row)) for row in rows]
 
     def obv5_signals(self, symbol: str, signal_date: str | None = None) -> list[dict[str, Any]]:
         """Return stored OBV5 signals with period and offset evidence."""

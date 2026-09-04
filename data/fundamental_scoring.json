@@ -1,12 +1,40 @@
 {
   "version": "1.1",
+  "profiles": {
+    "base": {
+      "weights": {
+        "earnings_growth": 25,
+        "ebitda_margin": 20,
+        "gross_margin": 15,
+        "free_cash_flow_yield": 15,
+        "analyst_consensus": 15,
+        "target_upside": 5,
+        "institutional_ownership": 10
+      }
+    },
+    "qgr": {
+      "weights": {
+        "earnings_growth": 25,
+        "ebitda_margin": 20,
+        "gross_margin": 15,
+        "free_cash_flow_yield": 15,
+        "analyst_consensus": 15,
+        "target_upside": 5,
+        "institutional_ownership": 10,
+        "short_interest_float": 10
+      },
+      "score_ranges": {
+        "short_interest_float": [0, 50]
+      }
+    }
+  },
   "normalized_score_bounds": [-100, 100],
-  "candidate_limit": 20,
+  "candidate_limit": 250,
   "include_generic_overflow": true,
   "generic_long_min_score": 0,
   "generic_short_max_score": 0,
-  "long_limit": 20,
-  "short_limit": 20,
+  "long_limit": 250,
+  "short_limit": 250,
   "minimum_completeness": 0.6,
   "weights": {
     "earnings_growth": 25,

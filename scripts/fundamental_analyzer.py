@@ -35,10 +35,23 @@ SCORING_CONFIG_PATH = os.path.join(PROJECT_DIR, "data", "fundamental_scoring.jso
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 
 
-def load_scoring_config():
+def load_scoring_config(profile="base"):
     """Load scoring rules once so each output records the active configuration."""
     with open(SCORING_CONFIG_PATH, "r", encoding="utf-8") as config_file:
         config = json.load(config_file)
+    profiles = config.get("profiles", {})
+    if profile not in profiles:
+        raise ValueError(
+            f"Unknown scoring profile '{profile}'. Available profiles: {', '.join(sorted(profiles))}"
+        )
+    selected = profiles[profile]
+    base_score_ranges = dict(config.get("score_ranges", {}))
+    config = {**config, **selected, "profile": profile}
+    config["weights"] = dict(selected["weights"])
+    config["score_ranges"] = {
+        **base_score_ranges,
+        **selected.get("score_ranges", {}),
+    }
     weights = config["weights"]
     if sum(weights.values()) <= 0:
         raise ValueError("Fundamental scoring weights must have a positive total")
@@ -65,6 +78,7 @@ def calculate_fundamental_score(row, config):
         return score, 1.0, "ETF_RULES"
 
     ranges = config["score_ranges"]
+    weights = config["weights"]
     components = {
         "earnings_growth": bounded_score(row.get("Earnings_Growth_YoY", 0.0), *ranges["earnings_growth"], score_min, score_max),
         "ebitda_margin": bounded_score(row.get("EBITDA_Margin", 0.0), *ranges["ebitda_margin"], score_min, score_max),
@@ -74,7 +88,19 @@ def calculate_fundamental_score(row, config):
         "target_upside": bounded_score(row.get("Sentiment_Target_Upside", 0.0), *ranges["target_upside"], score_min, score_max),
         "institutional_ownership": bounded_score(row.get("Institutional_Ownership_Pct", 0.0), *ranges["institutional_ownership"], score_min, score_max),
     }
-    weights = config["weights"]
+    if "short_interest_float" in weights:
+        short_interest = pd.to_numeric(row.get("Short_Percent_Of_Float"), errors="coerce")
+        if pd.notna(short_interest):
+            short_lower, short_upper = ranges["short_interest_float"]
+            components["short_interest_float"] = bounded_score(
+                short_upper - float(short_interest),
+                0.0,
+                short_upper - short_lower,
+                score_min,
+                score_max,
+            )
+        else:
+            components["short_interest_float"] = 0.0
     score = round(sum(components[name] * weights[name] for name in components) / sum(weights.values()), 2)
     required = ["Earnings_Growth_YoY", "EBITDA_Margin", "Gross_Margin", "Free_Cash_Flow_Yield", "Analyst_Rec_Score", "Sentiment_Target_Upside", "Institutional_Ownership_Pct"]
     available = sum(pd.notna(row.get(name)) for name in required)
@@ -99,40 +125,75 @@ def write_candidate_outputs(frame, target_date, scope, config):
             scored[column] = default
     calculated = scored.apply(lambda row: calculate_fundamental_score(row, config), axis=1, result_type="expand")
     scored[["Fundamental_Score", "Fundamental_Data_Completeness", "Fundamental_Score_Model"]] = calculated
+    scored["Scoring_Profile"] = config["profile"]
     scored["Fundamental_Qualification"] = "UNQUALIFIED"
     eligible = scored["Fundamental_Data_Completeness"] >= config["minimum_completeness"]
     scored.loc[~eligible, "Fundamental_Qualification"] = "INSUFFICIENT_DATA"
-    ranked = scored.loc[eligible].sort_values("Fundamental_Score", ascending=False)
-    long_rows = ranked.head(config["long_limit"]).copy()
-    short_rows = ranked.tail(config["short_limit"]).sort_values("Fundamental_Score").copy()
+    ranked = scored.loc[eligible].sort_values(
+        ["Fundamental_Score", "Symbol"], ascending=[False, True]
+    )
+    positive_ranked = ranked[ranked["Fundamental_Score"] > 0]
+    negative_ranked = ranked[ranked["Fundamental_Score"] < 0].sort_values(
+        ["Fundamental_Score", "Symbol"], ascending=[True, True]
+    )
+    if config["long_limit"] == 0:
+        long_rows = positive_ranked.copy()
+    else:
+        long_rows = positive_ranked.head(config["long_limit"]).copy()
+    if config["short_limit"] == 0:
+        short_rows = negative_ranked.copy()
+    else:
+        short_rows = negative_ranked.head(config["short_limit"]).copy()
     scored.loc[long_rows.index, "Fundamental_Qualification"] = "QUALIFIED_LONG"
     scored.loc[short_rows.index, "Fundamental_Qualification"] = "QUALIFIED_SHORT"
+    score_zero_rows = scored.loc[eligible & (scored["Fundamental_Score"] == 0)].copy()
+    scored.loc[score_zero_rows.index, "Fundamental_Qualification"] = "QUALIFIED_SCORE0"
     scored["Candidate_Selection_Reason"] = "TOP_SCORE_LIMIT"
     generic_mask = scored["Source_Watchlists"].fillna("").astype(str).str.split("|").apply(
         lambda values: "generic" in values
     )
     if scope == "all" and config.get("include_generic_overflow", False):
-        generic_long = scored.index[generic_mask & eligible & (scored["Fundamental_Score"] > config.get("generic_long_min_score", 0))]
-        generic_short = scored.index[generic_mask & eligible & (scored["Fundamental_Score"] < config.get("generic_short_max_score", 0))]
-        scored.loc[generic_long, "Fundamental_Qualification"] = "QUALIFIED_LONG"
-        scored.loc[generic_long, "Candidate_Selection_Reason"] = "GENERIC_SCORE_OVERFLOW_LONG"
-        scored.loc[generic_short, "Fundamental_Qualification"] = "QUALIFIED_SHORT"
-        scored.loc[generic_short, "Candidate_Selection_Reason"] = "GENERIC_SCORE_OVERFLOW_SHORT"
+        generic_long = scored.index[generic_mask & eligible & (scored["Fundamental_Score"] > max(0, config.get("generic_long_min_score", 0)))]
+        generic_short = scored.index[generic_mask & eligible & (scored["Fundamental_Score"] < min(0, config.get("generic_short_max_score", 0)))]
+        if config["long_limit"] != 0:
+            scored.loc[generic_long, "Fundamental_Qualification"] = "QUALIFIED_LONG"
+            scored.loc[generic_long, "Candidate_Selection_Reason"] = "GENERIC_SCORE_OVERFLOW_LONG"
+        if config["short_limit"] != 0:
+            scored.loc[generic_short, "Fundamental_Qualification"] = "QUALIFIED_SHORT"
+            scored.loc[generic_short, "Candidate_Selection_Reason"] = "GENERIC_SCORE_OVERFLOW_SHORT"
     scored["Fundamental_Rank"] = scored["Fundamental_Score"].rank(method="min", ascending=False).astype("Int64")
-    prefix = f"{target_date}_FUNDAMENTAL"
+    profile_label = config["profile"].upper()
+    prefix = f"{target_date}_{profile_label}_FUNDAMENTAL"
     if scope != "all":
-        prefix = f"{target_date}_{scope}_FUNDAMENTAL"
-    scored[scored["Fundamental_Qualification"] == "UNQUALIFIED"].to_csv(
+        prefix = f"{target_date}_{scope}_{profile_label}_FUNDAMENTAL"
+    scored[scored["Fundamental_Qualification"].isin(["UNQUALIFIED", "INSUFFICIENT_DATA"])].to_csv(
         os.path.join(OUTPUT_DIR, f"{prefix}_UNQUALIFIED.csv"), index=False, encoding="utf-8-sig"
     )
-    long_rows = scored[scored["Fundamental_Qualification"] == "QUALIFIED_LONG"]
-    short_rows = scored[scored["Fundamental_Qualification"] == "QUALIFIED_SHORT"]
+    long_rows = scored[scored["Fundamental_Qualification"] == "QUALIFIED_LONG"].sort_values(
+        ["Fundamental_Score", "Symbol"], ascending=[False, True]
+    )
+    short_rows = scored[scored["Fundamental_Qualification"] == "QUALIFIED_SHORT"].sort_values(
+        ["Fundamental_Score", "Symbol"], ascending=[True, True]
+    )
+    score_zero_rows = scored[scored["Fundamental_Qualification"] == "QUALIFIED_SCORE0"].sort_values(
+        "Symbol"
+    )
     long_rows.to_csv(os.path.join(OUTPUT_DIR, f"{prefix}_QUALIFIED_LONG.csv"), index=False, encoding="utf-8-sig")
     short_rows.to_csv(os.path.join(OUTPUT_DIR, f"{prefix}_QUALIFIED_SHORT.csv"), index=False, encoding="utf-8-sig")
+    score_zero_rows.to_csv(
+        os.path.join(OUTPUT_DIR, f"{prefix}_QUALIFIED_SCORE0.csv"),
+        index=False,
+        encoding="utf-8-sig",
+    )
 
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Run fundamental analysis on sanitized watchlists")
+    parser.add_argument(
+        "--profile",
+        default="base",
+        help="Scoring profile name from fundamental_scoring.json (default: base)",
+    )
     parser.add_argument(
         "--watchlist-key",
         default="all",
@@ -161,10 +222,11 @@ def parse_args():
         help="Override the JSON long and short candidate limits for this run",
     )
     args = parser.parse_args()
+    args.profile = args.profile.strip().lower()
     if args.refresh_days < 0:
         parser.error("--refresh-days cannot be negative")
-    if args.candidate_limit is not None and args.candidate_limit < 1:
-        parser.error("--candidate-limit must be positive")
+    if args.candidate_limit is not None and args.candidate_limit < 0:
+        parser.error("--candidate-limit cannot be negative")
     return args
 
 
@@ -197,7 +259,7 @@ def get_analysis_target_files(requested_key):
         if "-options" in name.lower():
             continue
         date_match = re.search(r"(\d{4}-\d{2}-\d{2})", name)
-        key_match = re.search(r"watchlist[-_]([A-Za-z0-9][A-Za-z0-9_-]*?)_SANITIZED\.csv$", name, re.IGNORECASE)
+        key_match = re.search(r"watchlist[-_]([A-Za-z0-9][A-Za-z0-9_+\-]*?)_SANITIZED\.csv$", name, re.IGNORECASE)
         if date_match and key_match:
             files.append((path, date_match.group(1), key_match.group(1).lower()))
     if requested_key != "all":
@@ -450,7 +512,7 @@ def run_fundamental_stage_analyzer():
     print("========================================================\n")
     
     cli_args = parse_args()
-    scoring_config = load_scoring_config()
+    scoring_config = load_scoring_config(cli_args.profile)
     if cli_args.candidate_limit is not None:
         scoring_config["long_limit"] = cli_args.candidate_limit
         scoring_config["short_limit"] = cli_args.candidate_limit
@@ -649,7 +711,7 @@ def run_fundamental_stage_analyzer():
                 combined_frames.append(df_final)
             else:
                 base_filename_string = filename.replace('.csv', '')
-                out_name = f"{base_filename_string}_FUND_PROCESSED.csv"
+                out_name = f"{base_filename_string}_{scoring_config['profile'].upper()}_FUND_PROCESSED.csv"
                 out_path = os.path.join(OUTPUT_DIR, out_name)
                 df_final.to_csv(out_path, index=False, encoding="utf-8-sig")
                 print(f"\n🏆 SUCCESS: Generated unified fundamental metrics sheet.")
@@ -668,7 +730,7 @@ def run_fundamental_stage_analyzer():
         combined["Source_Watchlists"] = combined["Symbol"].map(source_map)
         combined_path = os.path.join(
             OUTPUT_DIR,
-            f"{target_date}_watchlist_all_FUND_PROCESSED.csv",
+            f"{target_date}_watchlist_all_{scoring_config['profile'].upper()}_FUND_PROCESSED.csv",
         )
         combined.to_csv(combined_path, index=False, encoding="utf-8-sig")
         write_candidate_outputs(combined, target_date, requested_key, scoring_config)

@@ -21,8 +21,17 @@ import numpy as np
 import yfinance as yf
 from local_data_store import LocalDataStore
 import plotly.graph_objects as go
+from delta_engine import calculate_delta_metrics
+from market_data import load_market_history, translate_tos_symbol
+from ta_engine import calculate_panel3_indicators
+from macro_barometer_vector import fundamental_candidate_symbols, obv5_hit_symbols
 import plotly.io as pio
 from plotly.subplots import make_subplots
+from chart_builder import (
+    ChartConfig,
+    generate_unified_two_pane_chart as build_unified_two_pane_chart,
+    write_chart_viewer as build_chart_viewer,
+)
 
 # Silence yfinance terminal internal data warnings
 import logging
@@ -50,8 +59,8 @@ parser.add_argument(
 
 # OSCILLATOR LOOKBACK SWITCHES
 parser.add_argument("--mf_window", type=int, default=12, help="Market Forecast intermediate lookback (default: 12)")
-parser.add_argument("--stoch_k", type=int, default=9, help="Stochastic Slow %K channel window (default: 9)")
-parser.add_argument("--stoch_d", type=int, default=5, help="Stochastic Slow %D smoothing filter (default: 5)")
+parser.add_argument("--stoch_k", type=int, default=9, help="Stochastic Slow %%K channel window (default: 9)")
+parser.add_argument("--stoch_d", type=int, default=5, help="Stochastic Slow %%D smoothing filter (default: 5)")
 parser.add_argument(
     "--mf_stoch",
     type=int,
@@ -89,11 +98,47 @@ parser.add_argument(
     default="local",
     help="Market data source: local uses SQLite only (default); online preserves direct downloads; auto prefers local and backfills online",
 )
+parser.add_argument(
+    "--fundamental-candidates",
+    choices=("none", "long", "short", "both"),
+    default="none",
+    help="Append newest fundamental long/short candidates to the chart universe (default: none)",
+)
+parser.add_argument(
+    "--fundamental-profile",
+    default="base",
+    help="Fundamental candidate profile to append (default: base)",
+)
+parser.add_argument(
+    "--fundamental-limit",
+    type=int,
+    default=20,
+    help="Maximum candidates per selected long/short file; 0 means all (default: 20)",
+)
+parser.add_argument(
+    "--obv5-candidates",
+    choices=("none", "p4_all", "p5_ext", "p5_all"),
+    default="none",
+    help="Append symbols from the newest OBV5 latest-three-bar hits variant (default: none)",
+)
+parser.add_argument(
+    "--delta-weights",
+    default="1:1:2",
+    help="Relative VIX:UUP:SMA consensus weights (default: 1:1:2)",
+)
 
 args, unknown = parser.parse_known_args()
 
 if args.obv5_recent_bars < 0:
     parser.error("--obv5_recent_bars must be zero or greater")
+if args.fundamental_limit < 0:
+    parser.error("--fundamental-limit must be zero or greater")
+try:
+    DELTA_WEIGHTS = tuple(float(value) for value in args.delta_weights.split(":"))
+except ValueError:
+    parser.error("--delta-weights must use the VIX:UUP:SMA format, such as 1:1:2")
+if len(DELTA_WEIGHTS) != 3 or any(value < 0 for value in DELTA_WEIGHTS) or sum(DELTA_WEIGHTS) <= 0:
+    parser.error("--delta-weights requires three non-negative values with a positive total")
 
 NORM_WINDOW = args.window
 SHIFT_BARS = abs(args.shift)
@@ -169,102 +214,15 @@ Block 2 of 6: Technical Indicator Engines and Cumulative Math Normalizers.
 🎯 TYPE SHIELD ADDED: Natively forces date objects to strings to prevent strptime crashes.
 """
 
-def translate_tos_symbol(sym):
-    """Maps Thinkorswim system notation futures seamlessly into ETF anchors."""
-    clean_sym = str(sym).strip().upper()
-    if clean_sym.startswith('/'): clean_sym = clean_sym[1:]
-    mapping = {
-        'ES': 'SPY', 'NQ': 'QQQ', 'YM': 'DIA', 'RTY': 'IWM', 
-        'GC': 'GLD', 'SI': 'SLV', 'BZ': 'BNO', 'NG': 'UNG',
-        'ZT': 'SHY', 'ZB': 'TLT', 'ZN': 'IEF', 'ZF': 'IEI'
-    }
-    return mapping.get(clean_sym, clean_sym)
-
-
-def history_to_store_bars(history):
-    """Convert an OHLCV frame into the local SQLite bar tuple format."""
-    if history.empty or "Close" not in history.columns:
-        return []
-    bars = []
-    for index, row in history.dropna(subset=["Close"]).iterrows():
-        def value(column):
-            raw = row.get(column)
-            return None if pd.isna(raw) else float(raw)
-        bars.append((
-            pd.Timestamp(index).date().isoformat(), value("Open"), value("High"),
-            value("Low"), value("Close"), value("Adj Close"), value("Volume"),
-        ))
-    return bars
-
-
 def load_macro_history(symbol, minimum_bars=400):
-    """Load macro OHLCV locally, online, or with local-first backfill."""
-    clean_symbol = str(symbol).strip().upper()
-    lookup_symbols = [clean_symbol]
-    translated = translate_tos_symbol(clean_symbol)
-    if translated not in lookup_symbols:
-        lookup_symbols.append(translated)
-
-    if args.data_source in ("local", "auto") and DATABASE_PATH.exists():
-        store = LocalDataStore(DATABASE_PATH)
-        try:
-            for lookup_symbol in lookup_symbols:
-                rows = store.market_bars(lookup_symbol)
-                if len(rows) >= minimum_bars:
-                    history = pd.DataFrame(
-                        rows,
-                        columns=["Date", "Open", "High", "Low", "Close", "Adj Close", "Volume"],
-                    )
-                    history["Date"] = pd.to_datetime(history["Date"])
-                    history = history.set_index("Date")
-                    print(f"   📚 {clean_symbol}: using {len(history)} local bars from SQLite.")
-                    return history
-                if rows:
-                    print(
-                        f"   ⚠️ {clean_symbol}: local history has {len(rows)} bars; "
-                        f"{minimum_bars} required for macro/OBV5 calculations."
-                    )
-        finally:
-            store.close()
-
-    if args.data_source == "local":
-        print(f"   ⏭️ {clean_symbol}: insufficient local history; skipping in local mode.")
-        return pd.DataFrame()
-
-    yahoo_symbol = translated
-    print(f"   🌐 {clean_symbol}: local history insufficient; backfilling 6y from Yahoo ({yahoo_symbol}).")
-    try:
-        downloaded = yf.download(yahoo_symbol, period="6y", auto_adjust=False, progress=False)
-    except Exception as error:
-        print(f"   ⚠️ {clean_symbol}: online backfill unavailable; skipping symbol ({error}).")
-        return pd.DataFrame()
-    if downloaded.empty:
-        print(f"   ⚠️ {clean_symbol}: online backfill returned no usable history; skipping symbol.")
-        return downloaded
-    if isinstance(downloaded.columns, pd.MultiIndex):
-        for level in range(downloaded.columns.nlevels):
-            level_values = {str(value) for value in downloaded.columns.get_level_values(level)}
-            if "Close" in level_values:
-                downloaded.columns = downloaded.columns.get_level_values(level)
-                break
-    downloaded.columns = [str(column) for column in downloaded.columns]
-
-    if DATABASE_PATH.parent.exists():
-        store = LocalDataStore(DATABASE_PATH)
-        try:
-            asset_id = store.upsert_asset(clean_symbol, "future_or_index" if clean_symbol.startswith("/") else "equity_or_fund", None, datetime.now().strftime("%Y-%m-%d"))
-            store.save_bars(asset_id, history_to_store_bars(downloaded))
-            store.commit()
-        finally:
-            store.close()
-    if len(downloaded) < minimum_bars:
-        print(
-            f"   ⚠️ {clean_symbol}: backfill cached {len(downloaded)} bars, "
-            f"but {minimum_bars} are required; result remains short-history."
-        )
-    else:
-        print(f"   ✅ {clean_symbol}: backfill cached with {len(downloaded)} bars in SQLite.")
-    return downloaded
+    """Compatibility wrapper over the shared local-first market loader."""
+    return load_market_history(
+        symbol,
+        data_source=args.data_source,
+        db_path=DATABASE_PATH,
+        minimum_bars=minimum_bars,
+        verbose=True,
+    )
 
 
 def close_series(history):
@@ -285,63 +243,6 @@ def min_max_normalize_shifted_series(window, shift, series):
     h_max = boundary_range_subset.max()
     denom = h_max - h_min if (h_max - h_min) != 0 else 1.0
     return pd.Series(SCALE_MIN + ((series - h_min) / denom) * (SCALE_MAX - SCALE_MIN), index=series.index)
-
-
-def normalize_panel3_series(series, range_param, shift_param):
-    """Normalize one Panel 3 series using the fixed historical-to-latest window."""
-    end_idx = len(series) - shift_param
-    start_idx = max(0, end_idx - range_param)
-    window = series.iloc[start_idx:end_idx].dropna()
-    if window.empty:
-        return pd.Series(np.nan, index=series.index)
-
-    minimum = float(window.min())
-    maximum = float(window.max())
-    denominator = maximum - minimum
-    if denominator == 0:
-        return pd.Series(SCALE_MIN, index=series.index)
-
-    return SCALE_MIN + (
-        (series - minimum) / denominator
-    ) * (SCALE_MAX - SCALE_MIN)
-
-
-def compute_kst(close):
-    """Compute the standard four-ROC Know Sure Thing oscillator."""
-    def roc(period):
-        previous = close.shift(period).replace(0, np.nan)
-        return ((close - previous) / previous) * 100.0
-
-    sroc1 = roc(10).rolling(10).mean()
-    sroc2 = roc(15).rolling(10).mean()
-    sroc3 = roc(20).rolling(10).mean()
-    sroc4 = roc(30).rolling(15).mean()
-    return sroc1 + (2.0 * sroc2) + (3.0 * sroc3) + (4.0 * sroc4)
-
-
-def compute_money_flow_oscillator(high, low, close, volume, period):
-    """Compute a Chaikin-style money-flow oscillator with safe zero-range handling."""
-    price_range = (high - low).replace(0, np.nan)
-    money_flow_multiplier = ((close - low) - (high - close)) / price_range
-    money_flow_volume = money_flow_multiplier * volume
-    volume_sum = volume.rolling(period).sum().replace(0, np.nan)
-    return money_flow_volume.rolling(period).sum() / volume_sum
-
-
-def compute_tmf(high, low, close, volume, period=21):
-    """Compute Twiggs Money Flow."""
-    return compute_money_flow_oscillator(high, low, close, volume, period)
-
-
-def compute_cmf(high, low, close, volume, period=20):
-    """Compute Chaikin Money Flow."""
-    return compute_money_flow_oscillator(high, low, close, volume, period)
-
-
-def compute_cvd(close, volume):
-    """Compute directional-volume CVD approximation from daily OHLCV data."""
-    direction = np.sign(close.diff()).fillna(0.0)
-    return (direction * volume).cumsum()
 
 
 def compute_raw_obv_vector(close_series, volume_series):
@@ -543,7 +444,7 @@ QUANT TERMINAL - Step 5: Real-Time Multi-Regime Macro Barometer Dashboard
 Block 3 of 6: Master Charting Data Frame Pre-Processors and Raw OBV Radar Sweeps.
 """
 
-def generate_unified_two_pane_chart(symbol, anchors, consensus_positions, current_run_date):
+def _generate_unified_two_pane_chart_impl(symbol, anchors, consensus_positions, current_run_date):
     """Processes indices and alpha tokens identically into stretched 2-pane charts."""
     clean_sym = str(symbol).strip().upper()
     lbl_sym = clean_sym.replace('/', '')
@@ -573,21 +474,37 @@ def generate_unified_two_pane_chart(symbol, anchors, consensus_positions, curren
         if df_p.empty:
             print(f"   ⚠️ No overlapping market data available for {lbl_sym}; skipping chart.")
             return
+
+        delta_frame = calculate_delta_metrics(
+            df_p[["Close"]],
+            df_p[["VIX_Close"]].rename(columns={"VIX_Close": "Close"}),
+            df_p[["UUP_Close"]].rename(columns={"UUP_Close": "Close"}),
+            normalization_window=NORM_WINDOW,
+            range_bars=PLOT_RANGE,
+            shift_bars=SHIFT_BARS,
+            scale_min=SCALE_MIN,
+            scale_max=SCALE_MAX,
+        )
+        df_p = df_p.join(
+            delta_frame[[
+                "sma_close", "norm_asset", "norm_vix", "norm_uup", "norm_sma",
+                "delta_vix", "delta_uup", "delta_sma",
+            ]],
+            how="inner",
+        )
         
         # --- THE PHYSICAL ACCELERATOR: RAW OBV5 ANALYSIS LOOP ---
         df_p['raw_obv'] = compute_raw_obv_vector(df_p['Close'], df_p['Volume'])
-        df_p['tmf'] = compute_tmf(
-            df_p['High'], df_p['Low'], df_p['Close'], df_p['Volume']
+        df_p = calculate_panel3_indicators(
+            df_p,
+            range_bars=PLOT_RANGE,
+            shift_bars=SHIFT_BARS,
+            mf_window=MF_WINDOW,
+            stoch_k=STOCH_K,
+            stoch_d=STOCH_D,
+            scale_min=SCALE_MIN,
+            scale_max=SCALE_MAX,
         )
-        df_p['cmf'] = compute_cmf(
-            df_p['High'], df_p['Low'], df_p['Close'], df_p['Volume']
-        )
-        df_p['cvd'] = compute_cvd(df_p['Close'], df_p['Volume'])
-        df_p['kst'] = compute_kst(df_p['Close'])
-        for indicator_name in ('tmf', 'cmf', 'cvd', 'kst'):
-            df_p[f'norm_{indicator_name}'] = normalize_panel3_series(
-                df_p[indicator_name], PLOT_RANGE, SHIFT_BARS
-            )
         
         buy_marker_stack = {}
         sell_marker_stack = {}
@@ -636,30 +553,14 @@ def generate_unified_two_pane_chart(symbol, anchors, consensus_positions, curren
         OBV5_MULTIP = 1.0
         df_slice['norm_OBV_wave'] = raw_obv_wave * OBV5_MULTIP
         
-        roll_low = df_slice['Low'].rolling(window=MF_WINDOW, min_periods=1).min()
-        roll_high = df_slice['High'].rolling(window=MF_WINDOW, min_periods=1).max()
-        denom_mf = np.where((roll_high - roll_low) == 0, 1.0, roll_high - roll_low)
-        raw_market_forecast = ((df_slice['Close'] - roll_low) / denom_mf) * 100.0
-        
-        # INTERNAL FACTOR DAMPENERS: Compresses raw indicator amplitudes by half to prevent panel clutter
-        MF_DAMPENER = 2.0
-        STOCH_DAMPENER = 2.0
-        df_slice['market_forecast'] = 50.0 + (raw_market_forecast - 50.0) / MF_DAMPENER
-        
-        stoch_lowest = df_slice['Low'].rolling(window=STOCH_K, min_periods=1).min()
-        stoch_highest = df_slice['High'].rolling(window=STOCH_K, min_periods=1).max()
-        denom_stoch = np.where((stoch_highest - stoch_lowest) == 0, 1.0, stoch_highest - stoch_lowest)
-        raw_pct_k = ((df_slice['Close'] - stoch_lowest) / denom_stoch) * 100.0
-        
-        slow_k = raw_pct_k.rolling(window=3, min_periods=1).mean()
-        slow_d = slow_k.rolling(window=STOCH_D, min_periods=1).mean()
-        df_slice['stoch_delta_wave'] = 50.0 + ((slow_k - slow_d) * 1.5) / STOCH_DAMPENER
-        
-        df_slice['sma_r'] = df_slice['Close'].rolling(window=NORM_WINDOW, min_periods=1).mean()
-        df_slice['norm_s'] = min_max_normalize_shifted_series(NORM_WINDOW, SHIFT_BARS, df_slice['sma_r'])
-        df_slice['vs_vx'] = df_slice['norm_A'] - df_slice['norm_VIX']
-        df_slice['vs_uup'] = df_slice['norm_A'] - df_slice['norm_UUP']
-        df_slice['spring'] = df_slice['norm_A'] - df_slice['norm_s']
+        df_slice['sma_r'] = df_slice['sma_close']
+        df_slice['norm_s'] = df_slice['norm_sma']
+        df_slice['norm_A'] = df_slice['norm_asset']
+        df_slice['norm_VIX'] = df_slice['norm_vix']
+        df_slice['norm_UUP'] = df_slice['norm_uup']
+        df_slice['vs_vx'] = df_slice['delta_vix']
+        df_slice['vs_uup'] = df_slice['delta_uup']
+        df_slice['spring'] = df_slice['delta_sma']
         
         # FIX PASS INITIALIZATION KEY: Enforces absolute dual-Y channel readiness across both panels
         fig = make_subplots(
@@ -1595,7 +1496,18 @@ document.querySelectorAll('.qt-tab').forEach((tab) => tab.addEventListener('clic
         traceback.print_exc()
 
 
-def write_chart_viewer():
+def generate_unified_two_pane_chart(symbol, anchors, consensus_positions, current_run_date):
+    """Compatibility wrapper routed through the dedicated visual layer."""
+    return build_unified_two_pane_chart(
+        symbol,
+        anchors,
+        consensus_positions,
+        current_run_date,
+        renderer=_generate_unified_two_pane_chart_impl,
+    )
+
+
+def _write_chart_viewer_impl():
     """Create a local, keyboard-friendly viewer for the generated chart pages."""
     chart_names = sorted(
         name for name in os.listdir(CHARTS_DIR)
@@ -1681,6 +1593,11 @@ showChart(0);
         viewer_file.write(viewer_html)
     print(f"🖼️ Chart viewer generated -> {viewer_path}")
 
+
+def write_chart_viewer():
+    """Compatibility wrapper routed through the dedicated visual layer."""
+    return build_chart_viewer(renderer=_write_chart_viewer_impl)
+
 """
 QUANT TERMINAL - Step 5: Real-Time Multi-Regime Macro Barometer Dashboard
 Block 5 of 6: Central Pipeline Orchestration and Broad Anchor Data Harvesters.
@@ -1693,10 +1610,44 @@ def run_macro_barometer_pipeline():
     print(f"📊 Display View Range Horizon:   {PLOT_RANGE} Bars")
     print(f"⚖️ Mathematical Backtest Shift:  {SHIFT_BARS} Bars Back")
     print(f"📏 Scale Constraints Injected:  Min={SCALE_MIN} | Max={SCALE_MAX}")
+    print(f"⚖️ Delta Family Weights (VIX:UUP:SMA): {args.delta_weights}")
     print("========================================================\n")
     
     current_run_date = datetime.now().strftime("%Y-%m-%d")
     index_symbols, alpha_singles = parse_telemetry_config()
+    candidate_symbols = fundamental_candidate_symbols(
+        args.fundamental_candidates,
+        profile=args.fundamental_profile,
+        limit=args.fundamental_limit,
+    )
+    obv5_symbols = obv5_hit_symbols(args.obv5_candidates)
+    index_symbols = list(dict.fromkeys(str(symbol).strip().upper() for symbol in index_symbols if str(symbol).strip()))
+    index_set = set(index_symbols)
+    alpha_singles = list(dict.fromkeys(
+        str(symbol).strip().upper()
+        for symbol in alpha_singles
+        if str(symbol).strip() and str(symbol).strip().upper() not in index_set
+    ))
+    existing_symbols = index_set.union(alpha_singles)
+    candidate_symbols = list(dict.fromkeys(
+        symbol for symbol in candidate_symbols if symbol not in existing_symbols
+    ))
+    alpha_singles.extend(candidate_symbols)
+    if candidate_symbols:
+        print(
+            f"📌 Appended {len(candidate_symbols)} unique fundamental "
+            f"{args.fundamental_candidates} candidate symbols to the chart universe."
+        )
+    existing_symbols = index_set.union(alpha_singles)
+    obv5_symbols = list(dict.fromkeys(
+        symbol for symbol in obv5_symbols if symbol not in existing_symbols
+    ))
+    alpha_singles.extend(obv5_symbols)
+    if obv5_symbols:
+        print(
+            f"📌 Appended {len(obv5_symbols)} unique OBV5 latest-three-bar "
+            f"{args.obv5_candidates.upper()} hit symbols to the chart universe."
+        )
     
     print(f"📡 Ingesting Risk Anchors (^VIX, UUP) via {args.data_source} data source...")
     vix_df = load_macro_history('^VIX')
@@ -1859,7 +1810,16 @@ def run_macro_barometer_pipeline():
         ledger_path = os.path.join(MACRO_DIR, "macro_tension_ledger.csv")
         ledger_df.to_csv(ledger_path, index=False)
         
-        mean_tension_pct = np.nanmean(breadth_tension_pool)
+        delta_family_means = {
+            "vix": np.nanmean(ledger_df["vix_pct"]),
+            "uup": np.nanmean(ledger_df["uup_pct"]),
+            "sma": np.nanmean(ledger_df["sma_pct"]),
+        }
+        weighted_total = sum(
+            weight * delta_family_means[key]
+            for weight, key in zip(DELTA_WEIGHTS, ("vix", "uup", "sma"))
+        )
+        mean_tension_pct = weighted_total / sum(DELTA_WEIGHTS)
         consensus_level = int(round((-mean_tension_pct) / 20.0))
         consensus_level = max(-5, min(5, consensus_level))
         long_multiplier = round(max(0.00, min(5.00, 2.50 - (mean_tension_pct / 40.0))), 2)
@@ -1873,6 +1833,10 @@ def run_macro_barometer_pipeline():
         
         output_data = {
             "Barometer_Level": [consensus_level], "Regime": [f"{final_regime} ({mean_tension_pct:0.1f}%)"],
+            "Delta_Weights_VIX_UUP_SMA": [args.delta_weights],
+            "Delta_Family_Mean_VIX": [round(delta_family_means["vix"], 2)],
+            "Delta_Family_Mean_UUP": [round(delta_family_means["uup"], 2)],
+            "Delta_Family_Mean_SMA": [round(delta_family_means["sma"], 2)],
             "Long_Multiplier": [long_multiplier], "Short_Multiplier": [short_multiplier],
             "Normalization_Lookback": [NORM_WINDOW], "Backtest_Shift_Bars": [SHIFT_BARS], "Effective_Run_Date": [static_dt_str]
         }
@@ -1881,6 +1845,12 @@ def run_macro_barometer_pipeline():
         
         print("\n" + "-" * 75)
         print(f"🏆 Unified Macro Consensus Position (As of {static_dt_str}): {mean_tension_pct:+.1f}%")
+        print(
+            f"📐 Weighted Delta Means (VIX/UUP/SMA): "
+            f"{delta_family_means['vix']:+.1f}% / "
+            f"{delta_family_means['uup']:+.1f}% / "
+            f"{delta_family_means['sma']:+.1f}%"
+        )
         print(f"📡 Portfolio Defensive Level Stance: {consensus_level:+} | {final_regime}")
         print(f"📊 Anti-Cyclical Capital Multiplier (long/cover):  {long_multiplier}x")
         print(f"📉 Anti-Cyclical Capital Multiplier (short/close): {short_multiplier}x")

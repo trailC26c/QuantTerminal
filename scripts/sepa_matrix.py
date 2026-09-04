@@ -94,7 +94,7 @@ def get_analysis_source_files(requested_key: str | None) -> list[Path]:
         match = re.search(r"(\d{4}-\d{2}-\d{2})", path.name)
         if not match:
             continue
-        key_match = re.search(r"watchlist[-_]([A-Za-z0-9][A-Za-z0-9_-]*?)_SANITIZED\.csv$", path.name, re.IGNORECASE)
+        key_match = re.search(r"watchlist[-_]([A-Za-z0-9][A-Za-z0-9_+\-]*?)_SANITIZED\.csv$", path.name, re.IGNORECASE)
         if key_match:
             candidates.append((path, match.group(1), key_match.group(1).lower()))
     if not candidates:
